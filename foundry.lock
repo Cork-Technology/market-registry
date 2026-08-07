@@ -1,0 +1,11 @@
+{
+  "lib/openzeppelin-contracts": {
+    "tag": {
+      "name": "v5.6.1",
+      "rev": "5fd1781b1454fd1ef8e722282f86f9293cacf256"
+    }
+  },
+  "lib/phoenix-private": {
+    "rev": "cbe13ee3ebd3ad589c3ef44bb6da69e931a366ee"
+  }
+}

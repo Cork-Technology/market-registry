@@ -1,0 +1,16 @@
+# Foundry build output
+out/
+
+# Foundry writes the RPC endpoint it used into cache/, which is where an
+# API-keyed endpoint would leak.
+cache/
+
+# Secrets
+.env
+
+# Tooling
+node_modules/
+docs/book/
+
+# OS
+.DS_Store
