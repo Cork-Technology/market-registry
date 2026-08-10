@@ -31,7 +31,7 @@ contract MockToken {
 ///
 ///           - Deterministic (default): returns a wrapper derived purely from `wrapperSalt` (and an
 ///             oracle from `morphoSalt`). Because `deploy` sets
-///             `salt = keccak256(abi.encode(ca, ref, caSource, refSource))`, a test can predict the
+///             `salt = keccak256(abi.encode(registry, ca, ref, caSource, refSource))`, a test can predict the
 ///             exact wrapper for a given pair AND resolved-source combination — that determinism is
 ///             what makes the repeat / mode-separation cases assertable.
 ///           - ZeroWrapper: returns `address(0)` — drives the `ZeroAddress` gate.
@@ -143,16 +143,17 @@ contract MockWrapperFactory is IWrapperFactory {
     }
 
     /// @notice The wrapper `deploy` will return in Deterministic mode. The salt is
-    ///         `keccak256(abi.encode(ca, ref, caSource, refSource))`, matching
+    ///         `keccak256(abi.encode(registry, ca, ref, caSource, refSource))`, matching
     ///         `MarketRegistry.deploy` — the two source addresses are the ones the requested
     ///         `OracleMode` actually resolved to, which is why a NAV and a PRICE wrapper for the same
-    ///         pair land on different addresses.
-    function predictWrapperFor(address ca, address ref, address caSource, address refSource)
+    ///         pair land on different addresses, and the registry address is in the hash so two
+    ///         registry instances sharing one factory never derive the same salt.
+    function predictWrapperFor(address registry_, address ca, address ref, address caSource, address refSource)
         external
         pure
         returns (address)
     {
-        return predictWrapper(keccak256(abi.encode(ca, ref, caSource, refSource)));
+        return predictWrapper(keccak256(abi.encode(registry_, ca, ref, caSource, refSource)));
     }
 
     // ── IWrapperFactory ────────────────────────────────────────────────────────────

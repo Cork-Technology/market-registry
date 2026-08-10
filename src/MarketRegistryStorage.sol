@@ -64,8 +64,9 @@ abstract contract MarketRegistryStorage {
 
     /// @dev Slot 9. The rate oracle `deploy` built for each (pair, resolved-sources) combination, or
     ///      the zero address if that combination was never deployed.
-    ///      Key: `keccak256(abi.encode(ca, ref, caSource, refSource))`, computed inline rather than in
-    ///      the library.
+    ///      Key: `keccak256(abi.encode(address(this), ca, ref, caSource, refSource))`, computed inline
+    ///      rather than in the library. The registry's own address is included because the key doubles
+    ///      as the factory's `CREATE2` salt — see the note on `deploy`.
     ///
     ///      The ONE store with no owner verbs. `deploy` is its only writer and it is permissionless,
     ///      so there is no `addWrappers` and no `removeWrappers`: governance neither creates nor

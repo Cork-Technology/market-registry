@@ -210,7 +210,9 @@ interface IMarketRegistry {
     ///      the stored wrapper without emitting or changing state (idempotent).
     ///
     ///      The three trailing fields are what make the wrapper record reproducible off-chain. The
-    ///      wrapper is stored under `keccak256(abi.encode(ca, ref, caSource, refSource))`, and those
+    ///      wrapper is stored under `keccak256(abi.encode(registry, ca, ref, caSource, refSource))` —
+    ///      the emitting registry's address is part of the key, so an indexer folding logs from more
+    ///      than one registry must key by emitter — and those
     ///      two source addresses are resolved at deploy time — in NAV mode a leg falls back to its
     ///      price source when it has none of its own. Emitting them records which source each leg
     ///      actually used, and `mode` records what was asked for, so a NAV wrapper and a price

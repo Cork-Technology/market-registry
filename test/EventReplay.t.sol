@@ -50,7 +50,9 @@ contract RegistryMirror {
     // ── the fold ──────────────────────────────────────────────────────────────
 
     /// @notice Apply one log record. Anything unrecognised is ignored, as an indexer would ignore it.
-    function applyEvent(bytes32[] memory topics, bytes memory data) external {
+    ///         The emitter rides along because the wrapper key includes the registry address — an
+    ///         indexer folding logs from two registries must not let their records collide.
+    function applyEvent(address emitter, bytes32[] memory topics, bytes memory data) external {
         if (topics.length == 0) return;
 
         if (topics[0] == IMarketRegistry.EntryAdded.selector) {
@@ -61,7 +63,8 @@ contract RegistryMirror {
             (, address caSource, address refSource,) = abi.decode(data, (uint8, address, address, address));
             address ca = address(uint160(uint256(topics[1])));
             address ref = address(uint160(uint256(topics[2])));
-            _wrappers[keccak256(abi.encode(ca, ref, caSource, refSource))] = address(uint160(uint256(topics[3])));
+            _wrappers[keccak256(abi.encode(emitter, ca, ref, caSource, refSource))] =
+                address(uint160(uint256(topics[3])));
         }
     }
 
@@ -156,8 +159,12 @@ contract RegistryMirror {
         return _recipeKeys[i];
     }
 
-    function wrapperFor(address ca, address ref, address caSource, address refSource) external view returns (address) {
-        return _wrappers[keccak256(abi.encode(ca, ref, caSource, refSource))];
+    function wrapperFor(address registry, address ca, address ref, address caSource, address refSource)
+        external
+        view
+        returns (address)
+    {
+        return _wrappers[keccak256(abi.encode(registry, ca, ref, caSource, refSource))];
     }
 }
 
@@ -269,7 +276,7 @@ contract EventReplayTest is RegistryFixture {
         Vm.Log[] memory logs = vm.getRecordedLogs();
         for (uint256 i = 0; i < logs.length; ++i) {
             if (logs[i].emitter != address(reg)) continue;
-            mirror.applyEvent(logs[i].topics, logs[i].data);
+            mirror.applyEvent(logs[i].emitter, logs[i].topics, logs[i].data);
         }
     }
 
@@ -366,7 +373,7 @@ contract EventReplayTest is RegistryFixture {
     function test_replay_rebuildsWrapperRecord() public view {
         // Both legs are price-only assets whose source is the token itself, so the sources echo the
         // pair — but the mirror learned that from the event, not from this test.
-        assertEq(mirror.wrapperFor(tokA, tokB, tokA, tokB), wrapper, "wrapper record not replayable");
+        assertEq(mirror.wrapperFor(address(reg), tokA, tokB, tokA, tokB), wrapper, "wrapper record not replayable");
         assertTrue(wrapper != address(0), "scenario must have deployed a wrapper");
     }
 

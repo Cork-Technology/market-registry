@@ -116,9 +116,14 @@ contract MarketRegistry is MarketRegistryRecipe, Initializable, IVersion {
     ///         PRICE wrapper's key — and if that wrapper is already recorded, a guard placed after the
     ///         short-circuit would hand it back as though it were a NAV oracle. Guarding first makes the
     ///         call fail identically whether or not the pair has been deployed before.
-    ///      3. Derive the key from `(ca, ref, caSource, refSource)`. FOUR values, not two: the source
+    ///      3. Derive the key from `(address(this), ca, ref, caSource, refSource)`. The source
     ///         addresses differ between modes, so a NAV wrapper and a price wrapper for the same pair
-    ///         can no longer land on the same mapping entry or the same `CREATE2` address.
+    ///         can no longer land on the same mapping entry or the same `CREATE2` address. The
+    ///         registry's own address is in the hash because the key doubles as the factory salt and
+    ///         the record of past deployments lives HERE, not in the factory: a redeployed registry
+    ///         pointed at the same factory starts with an empty record, and without its address in the
+    ///         salt its first `deploy` of an already-built pair would re-derive the old salt and revert
+    ///         on the `CREATE2` collision with no error data.
     ///      4. Short-circuit on a recorded key. No write, no event, no external call — which is why
     ///         steps 1 and 2 must not make one either.
     ///      5. Build, then record, then emit.
@@ -137,7 +142,7 @@ contract MarketRegistry is MarketRegistryRecipe, Initializable, IVersion {
             revert NavModeWithoutNavSource(ca, ref);
         }
 
-        bytes32 key = keccak256(abi.encode(ca, ref, caSel.source, refSel.source));
+        bytes32 key = keccak256(abi.encode(address(this), ca, ref, caSel.source, refSel.source));
         wrapper = _wrappers[key];
         if (wrapper != address(0)) return wrapper;
 
@@ -329,7 +334,7 @@ contract MarketRegistry is MarketRegistryRecipe, Initializable, IVersion {
         if (refStatus != LegStatus.OK) return address(0);
         if (mode == OracleMode.NAV && !caSel.useNav && !refSel.useNav) return address(0);
 
-        wrapper = _wrappers[keccak256(abi.encode(ca, ref, caSel.source, refSel.source))];
+        wrapper = _wrappers[keccak256(abi.encode(address(this), ca, ref, caSel.source, refSel.source))];
     }
 
     // ── enumeration (paginated) ────────────────────────────────────────────────
@@ -634,6 +639,6 @@ contract MarketRegistry is MarketRegistryRecipe, Initializable, IVersion {
 
     /// @inheritdoc IVersion
     function version() external pure returns (string memory) {
-        return "0.3.1";
+        return "0.3.2";
     }
 }

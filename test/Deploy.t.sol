@@ -3,6 +3,7 @@ pragma solidity ^0.8.30;
 import {Vm} from "forge-std/Test.sol";
 
 import {IMarketRegistry} from "../src/interfaces/IMarketRegistry.sol";
+import {MarketRegistry} from "../src/MarketRegistry.sol";
 import {RegistryFixture, mkNavOnlyAsset, mkPriceOnlyAsset, mkSourcelessAsset} from "./helpers/RegistryFixture.sol";
 import {MockWrapperFactory} from "./mocks/MockWrapperFactory.sol";
 import {one} from "./helpers/ArrayHelpers.sol";
@@ -14,10 +15,12 @@ import {one} from "./helpers/ArrayHelpers.sol";
 ///         surface.
 ///
 ///         IDEMPOTENCY (the reason this suite exists): a wrapper is recorded under
-///         `keccak256(abi.encode(ca, ref, caSource, refSource))` — FOUR values, because the two source
-///         addresses are the ones the requested `OracleMode` actually resolved to. A repeat `deploy`
-///         that resolves to the same sources returns the stored address with NO external call, NO write,
-///         and NO event. `MarketOracleDeployed` is emitted ONLY on a fresh deploy.
+///         `keccak256(abi.encode(address(this), ca, ref, caSource, refSource))` — the two source
+///         addresses are the ones the requested `OracleMode` actually resolved to, and the registry's
+///         own address keeps a redeployed registry from re-deriving a salt an earlier registry already
+///         spent at the shared factory. A repeat `deploy` that resolves to the same sources returns the
+///         stored address with NO external call, NO write, and NO event. `MarketOracleDeployed` is
+///         emitted ONLY on a fresh deploy.
 ///
 ///         The wrapper factory is the FIRST of the two immutable constructor arguments (there is no
 ///         owner-managed allowlist). `deploy` re-reads each asset's LIVE `decimals()`, and a vault leg
@@ -84,7 +87,7 @@ contract DeployTest is RegistryFixture {
     ///      The source addresses are part of the salt now, which is exactly why a `NAV` wrapper and a
     ///      `PRICE` wrapper for one pair no longer collide.
     function _predict(address ca_, address ref_, address caSource, address refSource) internal view returns (address) {
-        return wrapperFactory.predictWrapperFor(ca_, ref_, caSource, refSource);
+        return wrapperFactory.predictWrapperFor(address(iReg), ca_, ref_, caSource, refSource);
     }
 
     /// @dev The price-mode shorthand for the two setUp assets, whose sources are the tokens themselves.
@@ -111,6 +114,36 @@ contract DeployTest is RegistryFixture {
             predicted,
             "wrapper must be recorded for the pair and mode"
         );
+    }
+
+    // ── deploy_secondRegistry_samePair_distinctWrapper ───────────────────────────
+
+    /// @notice Two registry instances sharing ONE factory must never derive the same salt for the same
+    ///         pair — that is what the registry's own address in the key buys. Without it, a redeployed
+    ///         registry's first `deploy` of an already-built pair would replay the spent salt and the
+    ///         real factory's `CREATE2` would revert with no error data.
+    function test_deploy_secondRegistry_samePair_distinctWrapper() public {
+        vm.prank(alice);
+        address first = iReg.deploy(ca, ref, IMarketRegistry.OracleMode.PRICE);
+
+        // A second registry against the SAME factory, holding the same assets with the same sources.
+        MarketRegistry freshReg = new MarketRegistry();
+        freshReg.initialize(address(this), address(wrapperFactory), address(fixedRateOracleFactory));
+        IMarketRegistry fresh = IMarketRegistry(address(freshReg));
+        fresh.addAssets(one(mkPriceOnlyAsset(ca, "CA", ca, "USD")));
+        fresh.addAssets(one(mkPriceOnlyAsset(ref, "REF", ref, "USD")));
+
+        address second = fresh.deploy(ca, ref, IMarketRegistry.OracleMode.PRICE);
+
+        assertTrue(first != second, "same pair through a second registry must land on a fresh salt");
+        assertEq(
+            second,
+            wrapperFactory.predictWrapperFor(address(fresh), ca, ref, ca, ref),
+            "the second registry's wrapper must be keyed by ITS address"
+        );
+        // Each registry answers for its own record only.
+        assertEq(iReg.lookupWrapper(ca, ref, IMarketRegistry.OracleMode.PRICE), first);
+        assertEq(fresh.lookupWrapper(ca, ref, IMarketRegistry.OracleMode.PRICE), second);
     }
 
     // ── deploy_unregisteredAsset_revertsEntryNotFound ─────────────────────────────

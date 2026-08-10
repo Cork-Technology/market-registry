@@ -52,7 +52,7 @@ import {one} from "../../helpers/ArrayHelpers.sol";
 ///      2. **The registry constructor takes THREE arguments** — owner, wrapper factory, fixed-rate
 ///         oracle factory — and zero-checks both factories, so the handler deploys a real
 ///         {FixedRateOracleFactory} alongside the mock wrapper factory.
-///      3. **`deploy` takes an `OracleMode`** and wrappers are keyed by `(ca, ref, caSource,
+///      3. **`deploy` takes an `OracleMode`** and wrappers are keyed by `(registry, ca, ref, caSource,
 ///         refSource)`, so one pair can hold a NAV wrapper AND a price wrapper at once. The ghost pair
 ///         record therefore carries the MODE, and `lookupWrapper` is asked for it.
 ///      4. **The denomination lives on each SOURCE**, is validated at write time, and there is no
