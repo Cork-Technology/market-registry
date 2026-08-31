@@ -1,17 +1,21 @@
 # market-registry
 
 The Cork `MarketRegistry` Solidity contracts: the registry itself, the oracle
-adapter factories, the recipe contracts, and the 1inch limit-order adapter.
+adapter factories, the recipe contracts, the cross-chain net-asset-value feed,
+and the 1inch limit-order adapter.
 
 ## Prerequisites
 
 - [Foundry](https://book.getfoundry.sh/) (`forge`), solc `0.8.30`.
+- [pnpm](https://pnpm.io/) — the cross-chain contracts build against the
+  LayerZero packages pinned in `package.json`.
 
 Fetch every dependency, including the nested submodules under `lib/phoenix`,
 before building:
 
 ```bash
 git submodule update --init --recursive
+pnpm install
 ```
 
 ## Build and test

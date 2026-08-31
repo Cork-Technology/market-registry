@@ -45,6 +45,7 @@ pragma solidity ^0.8.30;
 import {IDefaultCorkController} from "contracts/interfaces/IDefaultCorkController.sol";
 import {IPoolManager, Market, MarketId} from "contracts/interfaces/IPoolManager.sol";
 import {PoolShare} from "contracts/core/assets/PoolShare.sol";
+import {ERC20Permit} from "@openzeppelin/contracts/token/ERC20/extensions/ERC20Permit.sol";
 import {BaseTest} from "@phoenix-test/forge/BaseTest.sol";
 import {DummyWETH} from "@phoenix-test/forge/mocks/DummyWETH.sol";
 import {CorkLimitOrderAdapter} from "../src/CorkLimitOrderAdapter.sol";
@@ -448,6 +449,96 @@ contract CorkLopE2ETest is BaseTest {
         assertEq(cst.allowance(bond, address(lop)), 0, "permit allowance exactly consumed");
         assertEq(cst.nonces(bond), 1, "the carried permit was executed");
         _assertNoCustody();
+    }
+
+    // ── Permit griefing: a public permit signature must not brick the order ─
+
+    /// @dev THE FRONT-RUN. A resting order's permit signature is public, so anyone can call
+    ///      `cst.permit` with it directly and consume the nonce before the fill lands. The cST
+    ///      must already exist for that attack to be possible at all, so this test creates the
+    ///      pool first, exactly as an earlier fill would have. The griefed fill must still
+    ///      complete: the front-runner granted the LOP the exact allowance the maker intended,
+    ///      and the adapter skips a permit whose allowance is already in place instead of
+    ///      re-executing it into a revert.
+    function test_e2e_frontRunPermit_fillStillCompletes() public {
+        uint256 cstShares = 20_000e18;
+        uint256 premiumAmount = 1_000e18;
+
+        // The pool (and with it the cST) exists before the fill, as after an earlier fill.
+        vm.prank(address(hook));
+        defaultCorkController.createNewPool(
+            IDefaultCorkController.PoolCreationParams({
+                pool: _derivedMarket(),
+                unwindSwapFeePercentage: UNWIND_FEE,
+                swapFeePercentage: SWAP_FEE,
+                isWhitelistEnabled: false
+            })
+        );
+        assertGt(predictedCst.code.length, 0, "cST exists before the fill");
+
+        CorkLimitOrderAdapter.PermitParams[] memory permits = _cstPermit(bondPk, bond, cstShares);
+        bytes memory extension = _buildExtensionWithPreInteraction(address(hook), _extraData(permits));
+
+        ILopOrderMixin.Order memory order = ILopOrderMixin.Order({
+            salt: _saltFor(extension),
+            maker: _addr(bond),
+            receiver: _addr(address(0)),
+            makerAsset: _addr(predictedCst),
+            takerAsset: _addr(address(premium)),
+            makingAmount: cstShares,
+            takingAmount: premiumAmount,
+            makerTraits: MakerTraits.wrap(_PRE_INTERACTION_CALL_FLAG | _HAS_EXTENSION_FLAG)
+        });
+        (bytes32 r, bytes32 vs) = _signOrder(bondPk, order);
+
+        // The attacker executes the maker's own permit signature, consuming nonce 0.
+        PoolShare cst = PoolShare(predictedCst);
+        vm.prank(makeAddr("attacker"));
+        cst.permit(bond, address(lop), cstShares, permits[0].deadline, permits[0].v, permits[0].r, permits[0].s);
+        assertEq(cst.nonces(bond), 1, "the attacker consumed the permit nonce");
+        assertEq(cst.allowance(bond, address(lop)), cstShares, "and granted the intended allowance");
+
+        TakerTraits takerTraits =
+            TakerTraits.wrap(_MAKER_AMOUNT_FLAG | (extension.length << _ARGS_EXTENSION_LENGTH_OFFSET));
+        vm.prank(lifter);
+        (uint256 made, uint256 took,) = lop.fillOrderArgs(order, r, vs, cstShares, takerTraits, extension);
+
+        assertEq(made, cstShares, "the griefed order still fills in full");
+        assertEq(took, premiumAmount, "and the premium was paid");
+        assertEq(cst.balanceOf(lifter), cstShares, "taker received the cST");
+        assertEq(cst.allowance(bond, address(lop)), 0, "the front-run allowance was exactly consumed");
+        assertEq(cst.nonces(bond), 1, "the adapter skipped the already-granted permit");
+        _assertNoCustody();
+    }
+
+    /// @dev THE OTHER HALF of the defensive execution: a wrongly-signed carried permit aborts
+    ///      the fill in `preInteraction`. The adapter no longer swallows permit failures — the
+    ///      permit here is signed by the WRONG key, so `permit` recovers a different owner and
+    ///      its revert bubbles up through the adapter, reverting the whole fill.
+    function test_e2e_uselessPermit_revertsTheFill() public {
+        uint256 cstShares = 20_000e18;
+        uint256 premiumAmount = 1_000e18;
+
+        CorkLimitOrderAdapter.PermitParams[] memory permits = _cstPermit(bidderPk, bond, cstShares);
+        bytes memory extension = _buildExtensionWithPreInteraction(address(hook), _extraData(permits));
+
+        ILopOrderMixin.Order memory order = ILopOrderMixin.Order({
+            salt: _saltFor(extension),
+            maker: _addr(bond),
+            receiver: _addr(address(0)),
+            makerAsset: _addr(predictedCst),
+            takerAsset: _addr(address(premium)),
+            makingAmount: cstShares,
+            takingAmount: premiumAmount,
+            makerTraits: MakerTraits.wrap(_PRE_INTERACTION_CALL_FLAG | _HAS_EXTENSION_FLAG)
+        });
+        (bytes32 r, bytes32 vs) = _signOrder(bondPk, order);
+
+        TakerTraits takerTraits =
+            TakerTraits.wrap(_MAKER_AMOUNT_FLAG | (extension.length << _ARGS_EXTENSION_LENGTH_OFFSET));
+        vm.expectPartialRevert(ERC20Permit.ERC2612InvalidSigner.selector);
+        vm.prank(lifter);
+        lop.fillOrderArgs(order, r, vs, cstShares, takerTraits, extension);
     }
 
     // ── Negative control: wrong caller cannot trigger the hook ─────────────

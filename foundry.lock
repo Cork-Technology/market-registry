@@ -5,7 +5,7 @@
       "rev": "5fd1781b1454fd1ef8e722282f86f9293cacf256"
     }
   },
-  "lib/phoenix-private": {
-    "rev": "cbe13ee3ebd3ad589c3ef44bb6da69e931a366ee"
+  "lib/phoenix": {
+    "rev": "68ae5837ec008b4c54e1fbc9c6a559bfa16f89e5"
   }
 }

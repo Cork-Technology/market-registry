@@ -76,6 +76,6 @@ contract AggregatorV2V3AdapterFactory is IAggregatorV2V3AdapterFactory, IVersion
 
     /// @inheritdoc IVersion
     function version() external pure returns (string memory) {
-        return "0.2.0";
+        return "0.3.0";
     }
 }

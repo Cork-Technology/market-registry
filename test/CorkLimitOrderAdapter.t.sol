@@ -908,18 +908,40 @@ contract CorkLimitOrderAdapterTest is Test {
 
     // -- Carried permits (PermitParams) -----------------------------------------------------------
 
-    /// @dev A carried permit that fails to execute must revert the whole fill. The mock cST has
-    ///      no `permit` function at all, standing in for any failed permit execution; the call
-    ///      bubbles an empty revert.
-    function test_reverts_whenCarriedPermitFails() public {
+    /// @dev A carried permit that fails to execute must revert the whole fill: the allowance
+    ///      the order depends on could not be granted, so there is nothing for the LOP's pull
+    ///      to find. The mock cST has no `permit` function at all, standing in for any failed
+    ///      permit execution; the missing selector reverts with empty data.
+    function test_carriedPermitFailure_revertsTheFill() public {
         CorkLimitOrderAdapter.PermitParams[] memory permits = new CorkLimitOrderAdapter.PermitParams[](1);
         permits[0].token = address(poolManager.cst());
         permits[0].value = 1e18;
         permits[0].deadline = block.timestamp + 1 days;
+
         IOrderMixin.Order memory order = _askOrder(1e18);
         bytes memory extraData = abi.encode(_params(), permits);
+
         vm.expectRevert(bytes(""));
         lop.callPreInteraction(hook, order, 1e18, 0, extraData);
+    }
+
+    /// @dev A permit whose allowance is ALREADY in place is skipped, so a front-runner who
+    ///      consumed the public signature (granting exactly what the maker intended) cannot
+    ///      brick the order. The mock cST still has no `permit` function — the fill completing
+    ///      proves the adapter never called it.
+    function test_carriedPermit_skippedWhenAllowanceAlreadyInPlace() public {
+        CorkLimitOrderAdapter.PermitParams[] memory permits = new CorkLimitOrderAdapter.PermitParams[](1);
+        permits[0].token = address(poolManager.cst());
+        permits[0].value = 1e18;
+        permits[0].deadline = block.timestamp + 1 days;
+
+        poolManager.cst().setAllowance(BOND, address(lop), 1e18);
+
+        lop.callPreInteraction(hook, _askOrder(1e18), 1e18, 0, abi.encode(_params(), permits));
+
+        assertEq(controller.createCalls(), 1, "the fill went through without executing the permit");
+        assertEq(poolManager.cst().balanceOf(BOND), 1e18, "and the mint went through");
+        _assertNoCustody();
     }
 
     // -- Non-standard ERC20 collateral -----------------------------------------------------------

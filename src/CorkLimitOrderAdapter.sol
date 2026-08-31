@@ -397,14 +397,10 @@ contract CorkLimitOrderAdapter is
         emit JITMinted(poolId, recipient, cstShares, collateralIn);
     }
 
-    /// @dev Execute every carried permit (see {PermitParams}) now that any JIT-created token
-    ///      exists: `_ensureMarket` above deployed the share tokens if this fill created the
-    ///      pool. Runs on every path, mint or no mint — a fill that only created the pool still
-    ///      leaves the party served holding a cST the LOP has no allowance over, and the permit
-    ///      is the only way to grant it. A permit that fails to execute reverts the whole fill.
     function _applyPermits(address owner, PermitParams[] memory permits) internal {
         for (uint256 i = 0; i < permits.length; i++) {
             PermitParams memory p = permits[i];
+            if (IERC20(p.token).allowance(owner, LIMIT_ORDER_PROTOCOL) >= p.value) continue;
             IERC20Permit(p.token).permit(owner, LIMIT_ORDER_PROTOCOL, p.value, p.deadline, p.v, p.r, p.s);
         }
     }
@@ -517,6 +513,6 @@ contract CorkLimitOrderAdapter is
 
     /// @inheritdoc IVersion
     function version() external pure returns (string memory) {
-        return "0.3.1";
+        return "0.3.3";
     }
 }

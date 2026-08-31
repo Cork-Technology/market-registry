@@ -6,6 +6,8 @@ solc_version = "0.8.30"
 evm_version = "cancun"
 optimizer = true
 optimizer_runs = 200
+build_info = true
+build_info_path = "out/build-info"
 skip = ["test/CorkLopE2E.t.sol"]
 
 [profile.lop]

@@ -11,6 +11,7 @@ import {IMorphoChainlinkOracleV2} from "@morpho-oracle/interfaces/IMorphoChainli
 import {IMorphoChainlinkOracleV2Factory} from "@phoenix/interfaces/IMorphoChainlinkOracleV2Factory.sol";
 import {WrapperRateConsumer} from "@phoenix/periphery/WrapperRateConsumer.sol";
 import {Initializable} from "@openzeppelin/contracts/proxy/utils/Initializable.sol";
+import {Create2} from "@openzeppelin/contracts/utils/Create2.sol";
 import {IVersion} from "./interfaces/IVersion.sol";
 import {IWrapperRateConsumerFactory} from "./interfaces/IWrapperRateConsumerFactory.sol";
 
@@ -59,6 +60,13 @@ contract WrapperRateConsumerFactory is IWrapperRateConsumerFactory, Initializabl
     /// @dev Mirrors Morpho's `isMorphoChainlinkOracleV2` indexing pattern: only instances created through
     ///      `createWrapperRateConsumer` are recorded, so this is the registry of factory-created wrappers.
     mapping(address wrapperRateConsumer => bool created) public isWrapperRateConsumer;
+
+    /// @inheritdoc IWrapperRateConsumerFactory
+    /// @dev The idempotency record. `createWrapperRateConsumer` is public and both of its deployments
+    ///      are CREATE2, so without this a front-runner who mirrors a registry's arguments would make
+    ///      every later identical call revert forever on the salt collision. Recording the wrapper
+    ///      under the full argument set turns that replay into a read.
+    mapping(bytes32 paramsHash => address wrapper) public wrapperByParams;
 
     /// @notice One-time setup, called in the deployment transaction by the `AtomicDeployer`.
     /// @param morphoFactory Address of the `MorphoChainlinkOracleV2Factory` used to create the wrapped oracles.
@@ -112,13 +120,31 @@ contract WrapperRateConsumerFactory is IWrapperRateConsumerFactory, Initializabl
         bytes32 morphoSalt,
         bytes32 wrapperSalt
     ) internal returns (address wrapper, address oracle) {
-        // POC FIX (ChainSecurity): the per-side share-equals-underlying decimals guard is gone. Offset vaults
-        // (share decimals != underlying decimals) now price correctly because this factory routes the right decimals
-        // to each consumer below — there is nothing left to reject here.
-
-        // POC FIX (see guides/oracle-decimals.md): derive BOTH decimals per side from the vault and feed each consumer
-        // the one it needs — UNDERLYING `asset().decimals()` to the Morpho oracle, SHARE `vault.decimals()` to the
-        // wrapper.
+        // Idempotency first: a byte-identical repeat call — including a front-runner's mirror of the
+        // arguments a registry is about to pass — gets the already-built pair back instead of
+        // replaying the spent CREATE2 salts and reverting. No write, no event on this path.
+        bytes32 paramsHash = keccak256(
+            abi.encode(
+                baseVault,
+                baseVaultConversionSample,
+                baseFeed1,
+                baseFeed2,
+                baseTokenDecimals,
+                quoteVault,
+                quoteVaultConversionSample,
+                quoteFeed1,
+                quoteFeed2,
+                quoteTokenDecimals,
+                morphoSalt,
+                wrapperSalt
+            )
+        );
+        {
+            address existing = wrapperByParams[paramsHash];
+            if (existing != address(0)) {
+                return (existing, address(WrapperRateConsumer(existing).MORPHO_ORACLE()));
+            }
+        }
 
         // Step 1: create the underlying Morpho oracle through the configured factory — UNDERLYING decimals.
         oracle = _createMorphoOracle(
@@ -138,6 +164,7 @@ contract WrapperRateConsumerFactory is IWrapperRateConsumerFactory, Initializabl
         // Step 2: deploy the wrapper around the freshly-created oracle — SHARE decimals.
         wrapper = _deployWrapper(oracle, wrapperSalt, baseTokenDecimals, quoteTokenDecimals);
 
+        wrapperByParams[paramsHash] = wrapper;
         isWrapperRateConsumer[wrapper] = true;
 
         emit CreateWrapperRateConsumer(msg.sender, wrapper, oracle);
@@ -194,6 +221,19 @@ contract WrapperRateConsumerFactory is IWrapperRateConsumerFactory, Initializabl
         uint256 shareBaseDecimals = _shareDecimals(morphoOracle.BASE_VAULT(), baseTokenDecimals);
         uint256 shareQuoteDecimals = _shareDecimals(morphoOracle.QUOTE_VAULT(), quoteTokenDecimals);
 
+        // Adopt-if-present: a byte-identical wrapper someone else already put at this CREATE2
+        // address is the same contract this call would deploy, so returning it (instead of
+        // colliding) keeps a front-runner from bricking the pair.
+        address predicted = Create2.computeAddress(
+            wrapperSalt,
+            keccak256(
+                abi.encodePacked(
+                    type(WrapperRateConsumer).creationCode, abi.encode(oracle, shareBaseDecimals, shareQuoteDecimals)
+                )
+            )
+        );
+        if (predicted.code.length > 0) return predicted;
+
         return address(new WrapperRateConsumer{salt: wrapperSalt}(oracle, shareBaseDecimals, shareQuoteDecimals));
     }
 
@@ -216,6 +256,6 @@ contract WrapperRateConsumerFactory is IWrapperRateConsumerFactory, Initializabl
 
     /// @inheritdoc IVersion
     function version() external pure returns (string memory) {
-        return "0.2.0";
+        return "0.3.0";
     }
 }

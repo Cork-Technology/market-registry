@@ -15,8 +15,8 @@ import {IRateOracle} from "../src/interfaces/IRateOracle.sol";
 ///      the boundary-value and no-privileged-surface cases below are new.
 ///
 ///      This suite does NOT extend `RegistryFixture`, which is the local convention for a contract that
-///      has nothing to do with the registry — `ConversionFeed.t.sol`, `AggregatorV2V3Adapter.t.sol` and
-///      `ERC4626ShareAdapter.t.sol` all extend `Test` directly, and only the registry-centred suites
+///      has nothing to do with the registry — `ConversionFeed.t.sol` and `AggregatorV2V3Adapter.t.sol`
+///      both extend `Test` directly, and only the registry-centred suites
 ///      (`AssetEnumOffset`, `Deploy`, `HopGraph`, `Recipe`) take the fixture. A `FixedRateOracle` needs
 ///      one constructor argument and no registry, no owner, no tokens and no feeds, so the fixture would
 ///      only add setup that every case here ignores.

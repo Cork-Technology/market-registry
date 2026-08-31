@@ -35,60 +35,43 @@ import {Create2} from "@openzeppelin/contracts/utils/Create2.sol";
 ///      the end of {deploy} would transfer nothing and delete nothing. A permissionless, stateless leftover is
 ///      harmless; the guarded salt is what keeps it unusable against us.
 contract AtomicDeployer {
-    /// @notice One contract in the batch: its creation code, and the initializer call to make right after.
-    /// @param initCode The contract creation code, without constructor arguments appended.
-    /// @param initCall The abi-encoded initializer call, or empty for a contract that needs none.
+    /// @notice One contract in the batch: creation code and initializer call.
     struct Deployment {
         bytes initCode;
         bytes initCall;
     }
 
-    /// @notice A freshly deployed contract's initializer call reverted, so the whole batch rolls back.
-    /// @param index Which batch entry failed.
-    /// @param reason The raw revert data bubbled up from the initializer.
     error InitializeFailed(uint256 index, bytes reason);
 
-    /// @notice Emitted for every contract the batch actually created (skipped ones stay silent).
-    /// @param deployed Where the contract landed.
-    /// @param sender The account whose guarded salt produced the address.
-    /// @param salt The caller-supplied salt, before guarding.
     event ContractDeployed(address indexed deployed, address indexed sender, bytes32 salt);
 
-    /// @notice Deploys every entry through CREATE2 under the caller's guarded salt and runs its initializer,
-    ///         all in one transaction. An entry whose address already has code is skipped untouched, which is
-    ///         what makes a re-run after a partial outage safe.
-    /// @param salt The raw salt; it is hashed with `msg.sender` before use, see {computeAddress}.
-    /// @param deployments The set, in dependency order: an entry's initializer may reference the address of an
-    ///        earlier entry, so whatever is referenced must sit earlier in the array.
-    /// @return deployed Each entry's address, whether it was created now or already live.
+    /// @notice Deploys and initializes a batch under the caller-guarded salt.
+    /// @dev An occupied target is skipped: its CREATE2 address already commits to the exact creation code, so the
+    ///      code there can only have come from the same init code. The source-owned deployment script separately
+    ///      verifies initializer state and safe prefix recovery before calling this function.
     function deploy(bytes32 salt, Deployment[] calldata deployments) external returns (address[] memory deployed) {
         bytes32 guardedSalt = _guard(msg.sender, salt);
         deployed = new address[](deployments.length);
 
         for (uint256 i; i < deployments.length; ++i) {
             address predicted = Create2.computeAddress(guardedSalt, keccak256(deployments[i].initCode));
-            if (predicted.code.length != 0) {
-                deployed[i] = predicted;
-                continue;
+            if (predicted.code.length == 0) {
+                predicted = Create2.deploy(0, guardedSalt, deployments[i].initCode);
+                if (deployments[i].initCall.length != 0) {
+                    (bool ok, bytes memory reason) = predicted.call(deployments[i].initCall);
+                    if (!ok) revert InitializeFailed(i, reason);
+                }
+                emit ContractDeployed(predicted, msg.sender, salt);
             }
 
-            deployed[i] = Create2.deploy(0, guardedSalt, deployments[i].initCode);
-
-            if (deployments[i].initCall.length != 0) {
-                (bool ok, bytes memory reason) = deployed[i].call(deployments[i].initCall);
-                if (!ok) revert InitializeFailed(i, reason);
-            }
-
-            emit ContractDeployed(deployed[i], msg.sender, salt);
+            deployed[i] = predicted;
         }
     }
 
-    /// @notice Predicts where {deploy} puts a contract for a given sender, salt, and creation-code hash.
     function computeAddress(address sender, bytes32 salt, bytes32 initCodeHash) external view returns (address) {
         return Create2.computeAddress(_guard(sender, salt), initCodeHash);
     }
 
-    /// @dev Binding the salt to the sender is the anti-squatting property described on the contract.
     function _guard(address sender, bytes32 salt) internal pure returns (bytes32) {
         return keccak256(abi.encodePacked(sender, salt));
     }

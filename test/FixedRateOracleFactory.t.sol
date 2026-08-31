@@ -21,7 +21,7 @@ import {IRateOracle} from "../src/interfaces/IRateOracle.sol";
 ///
 ///      This suite does NOT extend `RegistryFixture`. The local convention is that a suite takes the
 ///      fixture only when it needs a live registry — `AssetEnumOffset`, `Deploy`, `HopGraph` and `Recipe`
-///      do; `ConversionFeed`, `AggregatorV2V3Adapter` and `ERC4626ShareAdapter` extend `Test` directly.
+///      do; `ConversionFeed` and `AggregatorV2V3Adapter` extend `Test` directly.
 ///      This factory takes no constructor arguments and touches no registry state, so the fixture would
 ///      contribute nothing but unused setup. The registry-level wrapper over this factory
 ///      (`deployFixedRateOracle` / `predictFixedRateOracle`, which is idempotent precisely to hide the

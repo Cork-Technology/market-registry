@@ -16,12 +16,16 @@ interface ILatestAnswerFeed {
 ///         MarketRegistry / consumed by the Morpho oracle stack. `decimals` and `description` are fixed
 ///         at construction because the V2 surface does not expose them.
 /// @dev    FRESHNESS WARNING: this adapter carries NO heartbeat from the source. `startedAt` and
-///         `updatedAt` are stamped with `block.timestamp` on every call, so any downstream staleness
-///         check of the form `block.timestamp - updatedAt` is effectively a no-op. `roundId` and
-///         `answeredInRound` are always `0` — the source has no round history. Use this only where the
-///         source value's freshness and sign are guaranteed by other means. The answer is passed through
-///         verbatim (not validated `> 0`); consumers that require a positive price must check themselves.
+///         `updatedAt` are always `0` — the V2 surface exposes no timestamps, and the adapter does not
+///         invent any, so a downstream staleness check of the form `block.timestamp - updatedAt` FAILS
+///         rather than silently passing. `roundId` and `answeredInRound` are always `0` — the source
+///         has no round history. Use this only where the source value's freshness is guaranteed by
+///         other means. A zero or negative answer from the source reverts `NonPositiveAnswer` instead
+///         of being passed through.
 contract AggregatorV2V3Adapter is AggregatorV3Interface {
+    /// @notice The source reported a price that cannot be a valid positive price.
+    error NonPositiveAnswer(int256 answer);
+
     /// @notice The V2 source whose `latestAnswer()` this adapter re-exposes.
     address public immutable source;
 
@@ -40,20 +44,20 @@ contract AggregatorV2V3Adapter is AggregatorV3Interface {
         description = description_;
     }
 
-    /// @notice Legacy V2 read, forwarded verbatim from the source.
+    /// @notice Legacy V2 read; a zero or negative source answer reverts rather than passing through.
     function latestAnswer() external view returns (int256) {
-        return ILatestAnswerFeed(source).latestAnswer();
+        return _answer();
     }
 
     /// @inheritdoc AggregatorV3Interface
-    /// @dev roundId/answeredInRound are 0 and startedAt/updatedAt are block.timestamp (see contract warning).
+    /// @dev roundId/answeredInRound and startedAt/updatedAt are 0 (see contract warning).
     function latestRoundData()
         external
         view
         override
         returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound)
     {
-        return (0, ILatestAnswerFeed(source).latestAnswer(), block.timestamp, block.timestamp, 0);
+        return (0, _answer(), 0, 0, 0);
     }
 
     /// @inheritdoc AggregatorV3Interface
@@ -65,6 +69,13 @@ contract AggregatorV2V3Adapter is AggregatorV3Interface {
         override
         returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound)
     {
-        return (_roundId, ILatestAnswerFeed(source).latestAnswer(), block.timestamp, block.timestamp, _roundId);
+        return (_roundId, _answer(), 0, 0, _roundId);
+    }
+
+    /// @dev A price that is zero or negative is never usable by the oracle stack this adapter feeds,
+    ///      so it reverts here instead of poisoning a downstream product.
+    function _answer() private view returns (int256 answer) {
+        answer = ILatestAnswerFeed(source).latestAnswer();
+        if (answer <= 0) revert NonPositiveAnswer(answer);
     }
 }

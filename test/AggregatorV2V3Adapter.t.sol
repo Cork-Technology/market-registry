@@ -56,13 +56,12 @@ contract AggregatorV2V3AdapterTest is Test {
 
     function testLatestRoundDataPassesThroughAnswer() public {
         AggregatorV2V3Adapter adapter = _create();
-        vm.warp(1_700_000_000);
         (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound) =
             adapter.latestRoundData();
         assertEq(roundId, 0);
         assertEq(answer, INITIAL);
-        assertEq(startedAt, block.timestamp);
-        assertEq(updatedAt, block.timestamp);
+        assertEq(startedAt, 0);
+        assertEq(updatedAt, 0);
         assertEq(answeredInRound, 0);
         assertEq(adapter.latestAnswer(), INITIAL);
     }
@@ -76,18 +75,57 @@ contract AggregatorV2V3AdapterTest is Test {
         assertEq(adapter.latestAnswer(), next);
     }
 
-    function testUpdatedAtTracksBlockTimestamp() public {
+    /// @notice The adapter carries no heartbeat from the source, so it must never invent one: a
+    ///         fabricated `block.timestamp` would turn every downstream staleness check into a no-op.
+    function testTimestampsAreAlwaysZero() public {
         AggregatorV2V3Adapter adapter = _create();
         vm.warp(1_234_567);
-        (,,, uint256 updatedAt,) = adapter.latestRoundData();
-        assertEq(updatedAt, 1_234_567);
+        (,, uint256 startedAt, uint256 updatedAt,) = adapter.latestRoundData();
+        assertEq(startedAt, 0);
+        assertEq(updatedAt, 0);
+
+        (,, startedAt, updatedAt,) = adapter.getRoundData(42);
+        assertEq(startedAt, 0);
+        assertEq(updatedAt, 0);
     }
 
     function testGetRoundDataReturnsCurrentAnswer() public {
         AggregatorV2V3Adapter adapter = _create();
-        (uint80 roundId, int256 answer,,,) = adapter.getRoundData(42);
+        (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound) =
+            adapter.getRoundData(42);
         assertEq(roundId, 42);
         assertEq(answer, INITIAL);
+        assertEq(startedAt, 0);
+        assertEq(updatedAt, 0);
+        assertEq(answeredInRound, 42);
+    }
+
+    function testRevertOnZeroAnswer() public {
+        AggregatorV2V3Adapter adapter = _create();
+        source.set(0);
+
+        vm.expectRevert(abi.encodeWithSelector(AggregatorV2V3Adapter.NonPositiveAnswer.selector, int256(0)));
+        adapter.latestRoundData();
+
+        vm.expectRevert(abi.encodeWithSelector(AggregatorV2V3Adapter.NonPositiveAnswer.selector, int256(0)));
+        adapter.getRoundData(1);
+
+        vm.expectRevert(abi.encodeWithSelector(AggregatorV2V3Adapter.NonPositiveAnswer.selector, int256(0)));
+        adapter.latestAnswer();
+    }
+
+    function testRevertOnNegativeAnswer() public {
+        AggregatorV2V3Adapter adapter = _create();
+        source.set(-1);
+
+        vm.expectRevert(abi.encodeWithSelector(AggregatorV2V3Adapter.NonPositiveAnswer.selector, int256(-1)));
+        adapter.latestRoundData();
+
+        vm.expectRevert(abi.encodeWithSelector(AggregatorV2V3Adapter.NonPositiveAnswer.selector, int256(-1)));
+        adapter.getRoundData(1);
+
+        vm.expectRevert(abi.encodeWithSelector(AggregatorV2V3Adapter.NonPositiveAnswer.selector, int256(-1)));
+        adapter.latestAnswer();
     }
 
     function testFactoryPredictAndTrack() public {

@@ -1,0 +1,15 @@
+{
+  "name": "market-registry-contracts",
+  "version": "0.0.0",
+  "private": true,
+  "scripts": {
+    "build": "forge build --sizes",
+    "test": "forge test -vvv"
+  },
+  "devDependencies": {
+    "@layerzerolabs/lz-evm-messagelib-v2": "^3.0.168",
+    "@layerzerolabs/lz-evm-protocol-v2": "^3.0.168",
+    "@layerzerolabs/oapp-evm": "^0.4.1",
+    "solidity-bytes-utils": "^0.8.4"
+  }
+}

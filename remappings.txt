@@ -1,4 +1,8 @@
 @openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/
+@layerzerolabs/lz-evm-protocol-v2/=node_modules/@layerzerolabs/lz-evm-protocol-v2/
+@layerzerolabs/lz-evm-messagelib-v2/=node_modules/@layerzerolabs/lz-evm-messagelib-v2/
+@layerzerolabs/oapp-evm/=node_modules/@layerzerolabs/oapp-evm/
+solidity-bytes-utils/=node_modules/solidity-bytes-utils/
 @phoenix/=lib/phoenix/contracts/
 contracts/=lib/phoenix/contracts/
 @morpho-oracle/=lib/phoenix/lib/morpho-blue-oracles/src/morpho-chainlink/
