@@ -21,7 +21,7 @@ contract LiquidityPriceRecipe is BaseLiquidityRecipe, IVersion {
     }
 
     /// @inheritdoc BaseLiquidityRecipe
-    /// @dev `PRICE` sends the adapter's step 3 to `registry.deploy(ca, ref, OracleMode.PRICE)` for the
+    /// @dev `PRICE` sends the adapter's step 3 to `registry.deploy(ca, ref, OracleMode.PRICE, oracleSalt)` for the
     ///      pair's feed wrapper, which is the oracle the base contract's `resolve` and `verify` read.
     function _source() internal pure override returns (RecipeSource) {
         return RecipeSource.PRICE;

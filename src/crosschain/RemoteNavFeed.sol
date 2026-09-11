@@ -13,6 +13,7 @@ import {
     MessagingReceipt,
     Origin
 } from "@layerzerolabs/lz-evm-protocol-v2/contracts/interfaces/ILayerZeroEndpointV2.sol";
+import {SetConfigParam} from "@layerzerolabs/lz-evm-protocol-v2/contracts/interfaces/IMessageLibManager.sol";
 import {ILayerZeroReceiver} from "@layerzerolabs/lz-evm-protocol-v2/contracts/interfaces/ILayerZeroReceiver.sol";
 import {OptionsBuilder} from "@layerzerolabs/oapp-evm/contracts/oapp/libs/OptionsBuilder.sol";
 import {EVMCallRequestV1, ReadCodecV1} from "@layerzerolabs/oapp-evm/contracts/oapp/libs/ReadCodecV1.sol";
@@ -36,6 +37,9 @@ contract RemoteNavFeed is IRemoteNavFeed, AggregatorV3Interface, ILayerZeroRecei
     uint256 public constant override ROUND_TIMEOUT = 1 hours;
 
     /// @inheritdoc IRemoteNavFeed
+    uint256 public constant override SKIP_TIMEOUT = 1 days;
+
+    /// @inheritdoc IRemoteNavFeed
     /// @dev The lens response is the abi.encoding of five 32-byte words:
     ///      sample, assets, assetDecimals, blockNumber, timestamp.
     uint32 public constant override RESPONSE_SIZE = 160;
@@ -46,9 +50,18 @@ contract RemoteNavFeed is IRemoteNavFeed, AggregatorV3Interface, ILayerZeroRecei
     uint32 public constant override READ_CHANNEL = 4294967295;
 
     /// @inheritdoc IRemoteNavFeed
-    /// @dev Above the measured ~50.5k worst-case first delivery plus endpoint
-    ///      overhead, so a too-low value cannot brick refresh delivery.
+    /// @dev Measured in test/RemoteNavFeedGas.t.sol: the first delivery (seeds
+    ///      the scale, the worst case) costs ~50.5k with the feed warm and
+    ///      ~60.1k with every feed slot cold, plus ~8k endpoint overhead. The
+    ///      floor tracks the warm case (~58.5k end to end), the real usage the
+    ///      owner accepted; a cold delivery needs ~68.1k, so deployers
+    ///      should pass a comfortable margin above the floor (100k when in doubt).
     uint128 public constant override MIN_GAS_ALLOWANCE = 60_000;
+
+    /// @inheritdoc IRemoteNavFeed
+    /// @dev Source timestamps are stored as uint64, so `sourceTimestamp +
+    ///      MAX_STALENESS` cannot overflow a uint256 under this ceiling.
+    uint256 public constant override MAX_STALENESS_CEILING = type(uint64).max;
 
     /// @inheritdoc IRemoteNavFeed
     ILayerZeroEndpointV2 public immutable override ENDPOINT;
@@ -64,6 +77,8 @@ contract RemoteNavFeed is IRemoteNavFeed, AggregatorV3Interface, ILayerZeroRecei
     uint128 public immutable override GAS_ALLOWANCE;
     /// @inheritdoc IRemoteNavFeed
     uint256 public immutable override MAX_STALENESS;
+    /// @inheritdoc IRemoteNavFeed
+    address public immutable override READ_LIBRARY;
 
     /// @dev Fixed at deployment; strings cannot be immutable, so this is the
     ///      contract's only non-round storage written outside `lzReceive`.
@@ -88,9 +103,24 @@ contract RemoteNavFeed is IRemoteNavFeed, AggregatorV3Interface, ILayerZeroRecei
         uint16 confirmations,
         uint128 gasAllowance,
         uint256 maxStaleness,
+        address readLibrary,
+        SetConfigParam[] memory readConfig,
         string memory description_
     ) {
         if (gasAllowance < MIN_GAS_ALLOWANCE) revert GasAllowanceTooLow(gasAllowance);
+        if (maxStaleness > MAX_STALENESS_CEILING) revert MaxStalenessTooHigh(maxStaleness);
+        // The zero library and an empty config would fall back to LayerZero's
+        // mutable defaults, which is exactly what an immutable feed must not do.
+        if (readLibrary == address(0)) revert ZeroReadLibrary();
+        if (readConfig.length == 0) revert EmptyReadConfig();
+
+        // The feed is immutable, so its LayerZero configuration must be too. The
+        // endpoint lets an application configure itself, so the feed does it here,
+        // once, and never registers a delegate that could do it again later.
+        endpoint.setSendLibrary(address(this), READ_CHANNEL, readLibrary);
+        endpoint.setReceiveLibrary(address(this), READ_CHANNEL, readLibrary, 0);
+        endpoint.setConfig(address(this), readLibrary, readConfig);
+
         ENDPOINT = endpoint;
         TARGET_EID = targetEid;
         LENS = targetChainLens;
@@ -98,6 +128,7 @@ contract RemoteNavFeed is IRemoteNavFeed, AggregatorV3Interface, ILayerZeroRecei
         CONFIRMATIONS = confirmations;
         GAS_ALLOWANCE = gasAllowance;
         MAX_STALENESS = maxStaleness;
+        READ_LIBRARY = readLibrary;
         _description = description_;
     }
 
@@ -136,6 +167,26 @@ contract RemoteNavFeed is IRemoteNavFeed, AggregatorV3Interface, ILayerZeroRecei
     /// @inheritdoc IRemoteNavFeed
     function quoteRefresh() external view returns (MessagingFee memory) {
         return ENDPOINT.quote(_readParams(), address(this));
+    }
+
+    /// @inheritdoc IRemoteNavFeed
+    /// @dev The endpoint only accepts `inboundNonce + 1`, so the caller never
+    ///      names a round; that closes the door on skipping a live one. The
+    ///      round record is kept and `latestRound` is left alone: round ids are
+    ///      outbound nonces that only ever grow, and `refresh` already reopens
+    ///      after ROUND_TIMEOUT.
+    function skipStuckRound() external {
+        bytes32 self = bytes32(uint256(uint160(address(this))));
+        uint64 target = ENDPOINT.inboundNonce(address(this), READ_CHANNEL, self) + 1;
+        uint80 roundId = uint80(target);
+
+        Round storage round = _rounds[roundId];
+        if (round.startedAt == 0) revert UnknownRound(roundId);
+        if (round.updatedAt != 0) revert RoundAlreadyAnswered(roundId);
+        if (block.timestamp - round.startedAt < SKIP_TIMEOUT) revert RoundNotStuck(roundId);
+
+        ENDPOINT.skip(address(this), READ_CHANNEL, self, target);
+        emit RoundSkipped(roundId, msg.sender);
     }
 
     function _options() internal view returns (bytes memory) {
@@ -263,6 +314,8 @@ contract RemoteNavFeed is IRemoteNavFeed, AggregatorV3Interface, ILayerZeroRecei
         roundId = latestAnsweredRound;
         if (roundId == 0) revert NotInitialized();
         Round storage round = _rounds[roundId];
+        // Cannot overflow: sourceTimestamp is a uint64 and MAX_STALENESS is
+        // capped at MAX_STALENESS_CEILING by the constructor.
         if (block.timestamp > uint256(round.sourceTimestamp) + MAX_STALENESS) {
             revert StaleAnswer(roundId, round.sourceTimestamp);
         }

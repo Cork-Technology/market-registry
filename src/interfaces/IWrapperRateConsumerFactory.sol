@@ -23,13 +23,17 @@ interface IWrapperRateConsumerFactory {
     /// @notice The Morpho oracle factory used to create the wrapped `MorphoChainlinkOracleV2` instances.
     function MORPHO_FACTORY() external view returns (IMorphoChainlinkOracleV2Factory);
 
-    /// @notice The wrapper recorded for a full argument set of `createWrapperRateConsumer`.
+    /// @notice The wrapper recorded for a canonical argument set of `createWrapperRateConsumer`.
     /// @dev This is the idempotency contract: `paramsHash` is `keccak256(abi.encode(...))` over all
-    ///      twelve arguments in declaration order, and a byte-identical repeat call returns the
-    ///      wrapper recorded here instead of replaying the spent CREATE2 salts and reverting. That
-    ///      is what keeps a front-runner who mirrors a registry's arguments from bricking that
-    ///      registry's later `deploy` for the pair.
-    /// @param paramsHash The hash of the full argument set.
+    ///      twelve arguments in declaration order, with one substitution — on a vault side the
+    ///      caller's `baseTokenDecimals` / `quoteTokenDecimals` is replaced by the vault's underlying
+    ///      `asset().decimals()`, which is the value the factory actually hands to Morpho. A caller
+    ///      cannot key a second entry for the same oracle by changing a decimals value the factory
+    ///      ignores. A repeat call with the same canonical arguments returns the wrapper recorded here
+    ///      instead of replaying the spent CREATE2 salts and reverting. That is what keeps a
+    ///      front-runner who mirrors a registry's arguments from bricking that registry's later
+    ///      `deploy` for the pair.
+    /// @param paramsHash The hash of the canonical argument set.
     /// @return wrapper The recorded wrapper, or the zero address if this argument set was never built.
     function wrapperByParams(bytes32 paramsHash) external view returns (address wrapper);
 
@@ -39,8 +43,9 @@ interface IWrapperRateConsumerFactory {
     function isWrapperRateConsumer(address wrapperRateConsumer) external view returns (bool created);
 
     /// @notice Creates a `MorphoChainlinkOracleV2` through the configured Morpho factory, then deploys a
-    ///         `WrapperRateConsumer` wrapping it, atomically in one transaction. Idempotent: a byte-identical
-    ///         repeat call returns the already-built (wrapper, oracle) pair instead of reverting.
+    ///         `WrapperRateConsumer` wrapping it, atomically in one transaction. Idempotent: a repeat call with
+    ///         the same canonical arguments (see `wrapperByParams`) returns the already-built (wrapper, oracle)
+    ///         pair instead of reverting.
     /// @dev The base asset should be the collateral token and the quote asset the loan token, matching Morpho's
     ///      orientation. Decimals correctness is handled inside the ported `WrapperRateConsumer`, which derives each
     ///      side's decimals from the underlying `asset()` — so vaults whose ERC-4626 share decimals differ from their
@@ -53,7 +58,7 @@ interface IWrapperRateConsumerFactory {
     ///
     ///      Because the call is public and both deployments are CREATE2, an attacker could otherwise spend a
     ///      caller's salts first and turn every later identical call into a permanent revert. Idempotency closes
-    ///      that: a byte-identical repeat (see `wrapperByParams`) returns the recorded pair, and a wrapper that
+    ///      that: a canonical repeat (see `wrapperByParams`) returns the recorded pair, and a wrapper that
     ///      already sits at its CREATE2 address is adopted rather than redeployed. A collision at the Morpho
     ///      factory itself (someone spent `morphoSalt` there directly, outside this factory) is not recovered and
     ///      bubbles as the Morpho factory's revert.

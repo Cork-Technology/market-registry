@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.30;
+import {MarketRegistryLib} from "../../src/MarketRegistryLib.sol";
 import {IMarketRegistry} from "../../src/interfaces/IMarketRegistry.sol";
 import {MockERC20, MockVaultAsset, RevertingAsset} from "../mocks/HostileAssets.sol";
 
@@ -58,75 +59,79 @@ import {one} from "../helpers/ArrayHelpers.sol";
 ///         suites and this is the topology they need.
 ///
 ///      Every entry needs a source whose `denomination` is registered AND reaches US Dollars, so the
-///      consuming test must have registered `"USD"` / `"ETH"` (the constructor seeds both) and added
+///      consuming test must have `USD_UNIT` / `ETH_UNIT` registered (`initialize` seeds both) and added
 ///      the `ETH → USD` conversion feed BEFORE seeding the two Ether-denominated terminators.
 contract TenAssetSet {
     uint256 public constant COUNT = 13;
+
+    /// @dev The two seeded pseudo-units every entry here quotes in.
+    address internal constant USD_UNIT = MarketRegistryLib.USD_DENOMINATION;
+    address internal constant ETH_UNIT = MarketRegistryLib.ETH_DENOMINATION;
 
     /// @notice Deploy the topology and return entries in dependency order + the denomination each
     ///         entry's present source states.
     /// @dev Split into per-band helpers so no single frame holds enough locals to hit "stack too
     ///      deep" under the default (non-`via_ir`) profile. `entries` / `expected` are memory
     ///      reference types, so the helpers mutate the caller's arrays in place.
-    function build() external returns (IMarketRegistry.Asset[] memory entries, string[] memory expected) {
+    function build() external returns (IMarketRegistry.Asset[] memory entries, address[] memory expected) {
         entries = new IMarketRegistry.Asset[](COUNT);
-        expected = new string[](COUNT);
+        expected = new address[](COUNT);
         _terminators(entries, expected);
         _vaults(entries, expected);
         _acrdxAndUnregistered(entries, expected);
     }
 
     /// @dev Bands [0..5]: terminators. Leaves whose `asset()` reverts, each stating its denomination on
-    ///      its price source. USDC/USDe/USDS/AUSD → "USD"; WETH/wstETH → "ETH" (needs the ETH → USD
+    ///      its price source. USDC/USDe/USDS/AUSD → US Dollars; WETH/wstETH → Ether (needs the ETH → USD
     ///      feed added first, or `addAsset` reverts `NoConversionPathToUsd`).
-    function _terminators(IMarketRegistry.Asset[] memory entries, string[] memory expected) private {
-        entries[0] = _leaf(address(new RevertingAsset()), "USDC", "USD");
-        entries[1] = _leaf(address(new RevertingAsset()), "USDe", "USD");
-        entries[2] = _leaf(address(new RevertingAsset()), "USDS", "USD");
-        entries[3] = _leaf(address(new RevertingAsset()), "AUSD", "USD");
-        entries[4] = _leaf(address(new RevertingAsset()), "WETH", "ETH");
-        entries[5] = _leaf(address(new RevertingAsset()), "wstETH", "ETH");
-        expected[0] = "USD";
-        expected[1] = "USD";
-        expected[2] = "USD";
-        expected[3] = "USD";
-        expected[4] = "ETH";
-        expected[5] = "ETH";
+    function _terminators(IMarketRegistry.Asset[] memory entries, address[] memory expected) private {
+        entries[0] = _leaf(address(new RevertingAsset()), "USDC", USD_UNIT);
+        entries[1] = _leaf(address(new RevertingAsset()), "USDe", USD_UNIT);
+        entries[2] = _leaf(address(new RevertingAsset()), "USDS", USD_UNIT);
+        entries[3] = _leaf(address(new RevertingAsset()), "AUSD", USD_UNIT);
+        entries[4] = _leaf(address(new RevertingAsset()), "WETH", ETH_UNIT);
+        entries[5] = _leaf(address(new RevertingAsset()), "wstETH", ETH_UNIT);
+        expected[0] = USD_UNIT;
+        expected[1] = USD_UNIT;
+        expected[2] = USD_UNIT;
+        expected[3] = USD_UNIT;
+        expected[4] = ETH_UNIT;
+        expected[5] = ETH_UNIT;
     }
 
     /// @dev Bands [6..10]: vault chains whose `asset()` reaches a terminator this batch registered
     ///      earlier. bbqUSDC is two-level: its underlying is vbUSDC, one entry back. The chain matters
     ///      to `deriveDenomination`, which the walk suites call directly; `addAsset` itself only reads
     ///      the label stated on the NAV source.
-    function _vaults(IMarketRegistry.Asset[] memory entries, string[] memory expected) private {
+    function _vaults(IMarketRegistry.Asset[] memory entries, address[] memory expected) private {
         entries[6] = _vault(address(new MockVaultAsset(entries[1].addr)), "sUSDe"); // → USDe
         entries[7] = _vault(address(new MockVaultAsset(entries[2].addr)), "sUSDS"); // → USDS
         entries[8] = _vault(address(new MockVaultAsset(entries[3].addr)), "AUSD-HYT"); // → AUSD
         entries[9] = _vault(address(new MockVaultAsset(entries[0].addr)), "vbUSDC"); // → USDC
         entries[10] = _vault(address(new MockVaultAsset(entries[9].addr)), "bbqUSDC"); // → vbUSDC
-        expected[6] = "USD";
-        expected[7] = "USD";
-        expected[8] = "USD";
-        expected[9] = "USD";
-        expected[10] = "USD";
+        expected[6] = USD_UNIT;
+        expected[7] = USD_UNIT;
+        expected[8] = USD_UNIT;
+        expected[9] = USD_UNIT;
+        expected[10] = USD_UNIT;
     }
 
     /// @dev Band [11]: ACRDX-shaped leaf — the denomination is stated on the price source and the
     ///      source is never called. Band [12]: wUSDC, a vault whose underlying is a real but
     ///      UNREGISTERED plain token, so a `deriveDenomination` walk hops once and terminates on
     ///      nothing registered.
-    function _acrdxAndUnregistered(IMarketRegistry.Asset[] memory entries, string[] memory expected) private {
-        entries[11] = _leaf(address(new RevertingAsset()), "ACRDX", "USD");
-        expected[11] = "USD";
+    function _acrdxAndUnregistered(IMarketRegistry.Asset[] memory entries, address[] memory expected) private {
+        entries[11] = _leaf(address(new RevertingAsset()), "ACRDX", USD_UNIT);
+        expected[11] = USD_UNIT;
 
         address unregisteredUnderlying = address(new MockERC20("Unregistered", "UNREG", 6));
         address wUSDC = address(new MockVaultAsset(unregisteredUnderlying));
         entries[12] = _vault(wUSDC, "wUSDC");
-        expected[12] = "USD";
+        expected[12] = USD_UNIT;
     }
 
     /// @dev A leaf terminator: one PRICE source stating `denomination`, NAV slot absent.
-    function _leaf(address addr, string memory name, string memory denomination)
+    function _leaf(address addr, string memory name, address denomination)
         private
         pure
         returns (IMarketRegistry.Asset memory)
@@ -134,10 +139,10 @@ contract TenAssetSet {
         return mkPriceOnlyAsset(addr, name, addr, denomination);
     }
 
-    /// @dev A vault: one NAV source stating `"USD"`, PRICE slot absent. The label still has to be
+    /// @dev A vault: one NAV source quoting US Dollars, PRICE slot absent. The unit still has to be
     ///      registered and reachable, because `addAsset` validates every PRESENT source on its own.
     function _vault(address addr, string memory name) private pure returns (IMarketRegistry.Asset memory) {
-        return mkNavOnlyAsset(addr, name, addr, "USD");
+        return mkNavOnlyAsset(addr, name, addr, USD_UNIT);
     }
 }
 
@@ -146,9 +151,9 @@ contract TenAssetSet {
 ///         reachable without pranking) and adds the walk-shaped conveniences on top of the shared
 ///         fixture's deployment, denomination and conversion-feed helpers.
 /// @dev THE ORDERING RULE THIS HARNESS EXISTS TO ABSORB: an asset's sources are validated at WRITE
-///      time, so a denomination label must be registered and its dollar path must already be in the
-///      conversion-feed store before any asset naming it can be added. `setUp` therefore adds the
-///      `ETH → USD` edge up front — without it, every `"ETH"`-quoted price source would revert
+///      time, so a denomination unit must be registered and its dollar path must already be in the
+///      conversion-feed store before any asset quoting it can be added. `setUp` therefore adds the
+///      `ETH → USD` edge up front — without it, every Ether-quoted price source would revert
 ///      `NoConversionPathToUsd`.
 ///
 ///      Everything generic — `reg` / `iReg` / `wrapperFactory` / `fixedRateOracleFactory`, `USD_UNIT` /
@@ -164,13 +169,13 @@ contract TenAssetSet {
 ///      exists: it fired when the underlying-asset walk finished without producing an asset-level
 ///      denomination, and there is no asset-level denomination to produce. It was deliberately NOT
 ///      replaced with some other selector to keep the assertions alive — the closest surviving error,
-///      `UnregisteredDenomination("")`, answers a different question (is the label a registered one)
-///      and fires per source at write time rather than after a walk.
+///      `UnregisteredDenomination(address(0))`, answers a different question (is the unit a registered
+///      one) and fires per source at write time rather than after a walk.
 abstract contract WalkTestBase is RegistryFixture {
     function setUp() public virtual {
         _deployRegistry(address(this));
 
-        // The one edge that makes `"ETH"`-quoted sources writable at all. `"USD"` needs no edge: a
+        // The one edge that makes Ether-quoted sources writable at all. US Dollars needs no edge: a
         // unit that already IS the dollar sentinel resolves in zero hops.
         _addEthUsdFeed();
     }
@@ -178,15 +183,15 @@ abstract contract WalkTestBase is RegistryFixture {
     // ── convenience builders (thin wrappers over the file-level free functions) ──
 
     function _sourceUSD(address a) internal pure returns (IMarketRegistry.AssetSource memory) {
-        return mkPriceSource(a, "USD");
+        return mkPriceSource(a, USD_UNIT);
     }
 
-    function _sourceQuote(address a, string memory q) internal pure returns (IMarketRegistry.AssetSource memory) {
+    function _sourceQuote(address a, address q) internal pure returns (IMarketRegistry.AssetSource memory) {
         return mkPriceSource(a, q);
     }
 
     /// @dev An asset with a single PRICE source — the shape most walk cases need. The source carries
-    ///      its own denomination, so there is no separate label argument any more.
+    ///      its own denomination, so there is no separate denomination argument any more.
     function _asset1(address addr, string memory name, IMarketRegistry.AssetSource memory source)
         internal
         pure

@@ -49,7 +49,7 @@ abstract contract MarketRegistryStorage {
     ///      This store IS the denomination hop graph: each record is one directed edge, base unit →
     ///      quote unit, with an aggregator on it, and `MarketRegistryLib.resolvePath` walks these edges
     ///      to reach US Dollars. There is no adjacency list — see `resolvePath` for how the walk is
-    ///      bounded, and why its candidates come from `_denominationKeys` (slot 13) rather than from
+    ///      bounded, and why its candidates come from `_denominationKeys` (slot 12) rather than from
     ///      this store's own key array.
     mapping(bytes32 keyHash => IMarketRegistry.ConversionFeed) internal _feeds;
 
@@ -62,15 +62,23 @@ abstract contract MarketRegistryStorage {
 
     // ── deployed wrappers ───────────────────────────────────────────────────────
 
-    /// @dev Slot 9. The rate oracle `deploy` built for each (pair, resolved-sources) combination, or
-    ///      the zero address if that combination was never deployed.
-    ///      Key: `keccak256(abi.encode(address(this), ca, ref, caSource, refSource))`, computed inline
-    ///      rather than in the library. The registry's own address is included because the key doubles
-    ///      as the factory's `CREATE2` salt — see the note on `deploy`.
+    /// @dev Slot 9. The rate oracle `deploy` built for each (pair, mode, wiring) combination, or the
+    ///      zero address if that combination was never deployed.
+    ///      Key: `wrapperKey(ca, ref, mode)` — `keccak256(abi.encode(address(this), ca, ref, mode,
+    ///      base, quote))` where `base` and `quote` are the two fully resolved `LegWiring` structs,
+    ///      byte for byte what the factory is handed. Computed in the contract rather than in the
+    ///      library. The registry's own address is included because the key seeds the factory's
+    ///      `CREATE2` salt: the salt is `keccak256(abi.encode(key, oracleSalt))` with the caller's
+    ///      `oracleSalt` mixed in, so the key fixes the cache entry and the salt only fixes where the
+    ///      first deployment lands — see the note on `deploy`.
     ///
     ///      The ONE store with no owner verbs. `deploy` is its only writer and it is permissionless,
     ///      so there is no `addWrappers` and no `removeWrappers`: governance neither creates nor
-    ///      retires an entry here. Nor is there a key array — a permissionless writer would pay an
+    ///      retires an entry here. Re-keying is governance's only lever over this store, and the key
+    ///      is deliberately exactly as fine as the wiring: an edit that changes what the factory would
+    ///      be handed for a pair moves the pair to a new key and the old entry is simply never looked
+    ///      up again, while an edit that changes nothing the factory sees keeps serving the same
+    ///      wrapper. Nor is there a key array — a permissionless writer would pay an
     ///      extra `SSTORE` on every fresh build to serve a query the `MarketOracleDeployed` log
     ///      already answers, so enumeration is deliberately event-side only.
     mapping(bytes32 wrapperKey => address wrapper) internal _wrappers;
@@ -90,59 +98,34 @@ abstract contract MarketRegistryStorage {
 
     // ── denominations ───────────────────────────────────────────────────────────
 
-    /// @dev Slot 12. The registered denomination labels: label hash → the unit address that label
-    ///      names.
-    ///      Key: `keccak256(bytes(label))` — the raw label bytes, NOT `abi.encode`d, and NOT folded
-    ///      for case. Exact bytes, case-sensitive: `"USD"` and `"usd"` are different labels and only
-    ///      the registered spelling resolves. A denomination selects which conversion feeds an asset
-    ///      can bridge through, so it is a safety key and never gets `nameKey`'s case folding. Every
-    ///      present source's `denomination` must resolve here at WRITE time — see
-    ///      `IMarketRegistry.addDenominations` for the registration rules.
+    /// @dev Slot 12. Every registered denomination UNIT, in registration order — the enumeration
+    ///      `getDenominations` pages over and the candidate list `MarketRegistryLib.resolvePath` walks
+    ///      to find a two-hop intermediate.
     ///
-    ///      The unit address is the bridge between this store and the hop graph: `_feeds` is keyed on
-    ///      unit ADDRESSES, so registering a label is precisely the act of connecting it to the graph.
+    ///      A denomination is nothing but its unit address: a token, or a Chainlink `Denominations`
+    ///      pseudo-address for a currency with no token of its own. There is no record mapping and no
+    ///      label, for the same reason the recipe store has none — the address IS the entry. `_feeds`
+    ///      is keyed on unit addresses too, so registering a unit is precisely the act of letting a
+    ///      source quote in it and letting the bridge search try it as an intermediate.
     ///
-    ///      Registration is add-only: a label that already exists is rejected rather than overwritten,
-    ///      so RE-POINTING a label to a different unit is a removal followed by an add, and both halves
-    ///      show up in the log. Removing a label that live assets still name in a source is allowed and
-    ///      has teeth — those assets keep their stored entry and start failing at `deploy` with
-    ///      `UnregisteredDenomination`, the same way `removeConversionFeeds` strands an asset whose only
-    ///      path to US Dollars ran through the removed edge.
-    mapping(bytes32 labelHash => address unit) internal _denominations;
+    ///      Every present source's `denomination` must be in this set at WRITE time and again at
+    ///      `deploy` time. Removing a unit that live assets still quote in is allowed and has teeth —
+    ///      those assets keep their stored entry and start failing at `deploy` with
+    ///      `UnregisteredDenomination`, whether or not the pair was deployed before, because the wrapper
+    ///      record (slot 9) is keyed on the wiring and is not consulted until the unit has been checked.
+    ///      `removeConversionFeeds` strands an asset whose only path to US Dollars ran through the
+    ///      removed edge the same way.
+    ///
+    ///      No duplicates: `_addDenomination` rejects a unit already present, so the bridge search
+    ///      never probes the same intermediate twice. Same swap-on-remove caveat as `_assetKeys`, so a
+    ///      position is not a stable name for a denomination.
+    address[] internal _denominationKeys;
 
-    /// @dev Slot 13. Every registered denomination LABEL HASH, in registration order — the enumeration
-    ///      `getDenominations` pages over and `MarketRegistryLib.resolvePath` walks to find a two-hop
-    ///      intermediate. It exists because a mapping has no key list, so the store above cannot
-    ///      otherwise be enumerated.
-    ///
-    ///      ## Label hashes, NOT unit addresses
-    ///
-    ///      Storing the unit addresses directly would be one SLOAD cheaper per candidate and it would be
-    ///      WRONG. Two different labels MAY name the same unit, and the array must hold one entry per
-    ///      LABEL so that removing one of those labels leaves the other's bridge intact. Resolving the
-    ///      label hash through `_denominations` on every read keeps the array a list of labels and the
-    ///      mapping the single authority on what each one currently means.
-    ///
-    ///      ## The invariants
-    ///
-    ///      One entry per LABEL, and no duplicates: `_addDenomination` rejects a label already present.
-    ///      Every hash in this array resolves through `_denominations` to a NON-ZERO unit — the add path
-    ///      rejects a zero unit, and the remove path clears the mapping entry and pops this array
-    ///      together, so a hash can never outlive its unit. `resolvePath` depends on that pairing: a
-    ///      stale hash resolving to zero would merely probe `feedKey(fromUnit, address(0))`, find
-    ///      nothing, and continue, so the failure would be silent rather than loud.
-    ///
-    ///      Two different labels MAY still name the same unit; the search then probes that unit twice,
-    ///      which wastes gas and changes no answer. Positions shift on removal, so nothing may name a
-    ///      denomination by its index.
-    bytes32[] internal _denominationKeys;
-
-    /// @dev Slot 14. Position of each label hash in `_denominationKeys`, stored as `index + 1` so 0
-    ///      means absent — the same shape every other store uses, and what makes `removeDenominations`
-    ///      possible at all. Existence is this mapping, not `_denominations[labelHash] != address(0)`;
-    ///      the two agree by the pairing invariant above, and readers that only need the unit (
-    ///      `lookupDenomination`, `_requireDenomination`) may use the non-zero unit as the test.
-    mapping(bytes32 labelHash => uint256) internal _denominationIndex;
+    /// @dev Slot 13. Position of each unit in `_denominationKeys`, stored as `index + 1` so 0 means
+    ///      absent. This mapping IS the membership set — `isDenomination(u)` is
+    ///      `_denominationIndex[u] != 0` — and the same test gates every source write and every
+    ///      `deploy`.
+    mapping(address unit => uint256) internal _denominationIndex;
 
     // ── market bound ────────────────────────────────────────────────────────────
     //
@@ -153,7 +136,7 @@ abstract contract MarketRegistryStorage {
     // no natural key, so remove-then-add would mean deleting the bound and running with no bound at
     // all in between, which is precisely the state this slot exists to prevent.
 
-    /// @dev Slot 15. Longest life a market created through the periphery may have, in seconds, counted
+    /// @dev Slot 14. Longest life a market created through the periphery may have, in seconds, counted
     ///      from the moment of creation. Set in the constructor and by `setMaxExpiryDuration`, never
     ///      zero — see `IMarketRegistry.ZeroBound` for why zero is a kill switch rather than a bound.
     uint256 internal _maxExpiryDuration;

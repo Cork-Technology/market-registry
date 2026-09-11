@@ -25,8 +25,8 @@ import {one} from "./helpers/ArrayHelpers.sol";
 ///      the graph search itself; what is pinned here is that a batch add is subject to the same gate
 ///      and that a batch is all-or-nothing against it.
 contract AddAssetsBatchOrderingTest is WalkTestBase {
-    /// @dev A registered label with NO dollar edge behind it, used to demonstrate the write-time gate.
-    ///      `setUp` registers the label and deliberately does NOT add the feed; one test adds the edge
+    /// @dev A registered unit with NO dollar edge behind it, used to demonstrate the write-time gate.
+    ///      `setUp` registers the unit and deliberately does NOT add the feed; one test adds the edge
     ///      partway through and re-seeds the identical batch.
     address internal constant RESID_UNIT = address(0xDEC1DED);
 
@@ -35,7 +35,7 @@ contract AddAssetsBatchOrderingTest is WalkTestBase {
 
     function setUp() public override {
         super.setUp();
-        _registerDenomination("RESID", RESID_UNIT);
+        _registerDenomination(RESID_UNIT);
     }
 
     /// @dev Deploy a fresh (terminator, vault→terminator) pair, both stating `"USD"` on their one
@@ -57,8 +57,8 @@ contract AddAssetsBatchOrderingTest is WalkTestBase {
         address termAddr = address(new RevertingAsset()); // leaf: asset() reverts
         vaultAddr = address(new MockVaultAsset(termAddr)); // vault: asset() → terminator
 
-        terminator = _asset1(termAddr, string.concat("PAIRTERM", suffix), mkPriceSource(termAddr, "USD"));
-        vault = _asset2(vaultAddr, string.concat("PAIRVAULT", suffix), noSource(), mkNavSource(vaultAddr, "USD"));
+        terminator = _asset1(termAddr, string.concat("PAIRTERM", suffix), mkPriceSource(termAddr, USD_UNIT));
+        vault = _asset2(vaultAddr, string.concat("PAIRVAULT", suffix), noSource(), mkNavSource(vaultAddr, USD_UNIT));
     }
 
     // ── in-batch order no longer changes what is stored ───────────────────────────
@@ -93,17 +93,19 @@ contract AddAssetsBatchOrderingTest is WalkTestBase {
         iReg.addAssets(inverted);
 
         // Every entry stored the label its own present source stated, in both orders.
-        assertTrue(_eq(_storedDenomination(orderedTerm.addr, PRICE), "USD"), "ordered terminator label wrong");
-        assertTrue(_eq(_storedDenomination(invertedTerm.addr, PRICE), "USD"), "inverted terminator label wrong");
-        assertTrue(_eq(_storedDenomination(orderedVaultAddr, NAV), "USD"), "ordered vault label wrong");
-        assertTrue(
-            _eq(_storedDenomination(invertedVaultAddr, NAV), "USD"),
+        assertEq(_storedDenomination(orderedTerm.addr, PRICE), USD_UNIT, "ordered terminator label wrong");
+        assertEq(_storedDenomination(invertedTerm.addr, PRICE), USD_UNIT, "inverted terminator label wrong");
+        assertEq(_storedDenomination(orderedVaultAddr, NAV), USD_UNIT, "ordered vault label wrong");
+        assertEq(
+            _storedDenomination(invertedVaultAddr, NAV),
+            USD_UNIT,
             "inverted vault stored a different label: in-batch order still affects the write"
         );
 
         // And the two vaults agree with each other, which is the claim stated directly.
-        assertTrue(
-            _eq(_storedDenomination(orderedVaultAddr, NAV), _storedDenomination(invertedVaultAddr, NAV)),
+        assertEq(
+            _storedDenomination(orderedVaultAddr, NAV),
+            _storedDenomination(invertedVaultAddr, NAV),
             "the two orders produced different stored denominations"
         );
     }
@@ -122,7 +124,7 @@ contract AddAssetsBatchOrderingTest is WalkTestBase {
         address vaultAddr = address(new MockVaultAsset(termAddr));
 
         IMarketRegistry.Asset[] memory batch = new IMarketRegistry.Asset[](1);
-        batch[0] = _asset2(vaultAddr, "LATEFEED", noSource(), mkNavSource(vaultAddr, "RESID"));
+        batch[0] = _asset2(vaultAddr, "LATEFEED", noSource(), mkNavSource(vaultAddr, RESID_UNIT));
 
         vm.expectRevert(abi.encodeWithSelector(IMarketRegistry.NoConversionPathToUsd.selector, RESID_UNIT, uint256(2)));
         iReg.addAssets(batch);
@@ -131,12 +133,12 @@ contract AddAssetsBatchOrderingTest is WalkTestBase {
         assertFalse(foundBefore, "the rejected batch must have landed nothing");
 
         // Add the missing edge. Nothing about the batch changes.
-        _addFeed(RESID_UNIT, USD_UNIT, makeAddr("residUsdAggregator"), 8);
+        _addFeed(RESID_UNIT, USD_UNIT, makeAddr("residUsdAggregator"));
         iReg.addAssets(batch);
 
         (bool foundAfter,) = iReg.lookupAssetByAddress(vaultAddr);
         assertTrue(foundAfter, "batch should land once the dollar edge exists");
-        assertTrue(_eq(_storedDenomination(vaultAddr, NAV), "RESID"), "source label not stored verbatim");
+        assertEq(_storedDenomination(vaultAddr, NAV), RESID_UNIT, "source unit not stored verbatim");
     }
 
     /// @notice A batch add is the same insert path as a single-entry one, not a privileged genesis mode: a
@@ -145,7 +147,7 @@ contract AddAssetsBatchOrderingTest is WalkTestBase {
     ///      there is no counter, no seed lock, and no special first-write semantics. The predecessor
     ///      made this point by showing that the INVERTED batch and inverted single adds both produced
     ///      the caller residual; with no derivation left, the point is made by the two paths agreeing
-    ///      on the stored labels instead.
+    ///      on the stored units instead.
     function test_addAssetsBatch_hasNoSpecialGenesisSemantics() public {
         (IMarketRegistry.Asset memory batchTerm, IMarketRegistry.Asset memory batchVault, address batchVaultAddr) =
             _pair("BATCH");
@@ -159,14 +161,16 @@ contract AddAssetsBatchOrderingTest is WalkTestBase {
         iReg.addAssets(one(singleVault)); // dependent first, one at a time
         iReg.addAssets(one(singleTerm));
 
-        assertTrue(
-            _eq(_storedDenomination(batchVaultAddr, NAV), _storedDenomination(singleVaultAddr, NAV)),
+        assertEq(
+            _storedDenomination(batchVaultAddr, NAV),
+            _storedDenomination(singleVaultAddr, NAV),
             "single adds must store the same vault label as the batch"
         );
-        assertTrue(
-            _eq(_storedDenomination(batchTerm.addr, PRICE), _storedDenomination(singleTerm.addr, PRICE)),
+        assertEq(
+            _storedDenomination(batchTerm.addr, PRICE),
+            _storedDenomination(singleTerm.addr, PRICE),
             "single adds must store the same terminator label as the batch"
         );
-        assertTrue(_eq(_storedDenomination(singleVaultAddr, NAV), "USD"), "expected the stated label");
+        assertEq(_storedDenomination(singleVaultAddr, NAV), USD_UNIT, "expected the stated label");
     }
 }

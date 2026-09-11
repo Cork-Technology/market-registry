@@ -4,23 +4,32 @@ import {Vm} from "forge-std/Test.sol";
 
 import {IMarketRegistry} from "../src/interfaces/IMarketRegistry.sol";
 import {MarketRegistry} from "../src/MarketRegistry.sol";
-import {RegistryFixture, mkNavOnlyAsset, mkPriceOnlyAsset, mkSourcelessAsset} from "./helpers/RegistryFixture.sol";
+import {
+    RegistryFixture,
+    mkAsset,
+    mkNavOnlyAsset,
+    mkPriceOnlyAsset,
+    mkPriceSource,
+    mkSource,
+    mkSourcelessAsset
+} from "./helpers/RegistryFixture.sol";
 import {MockWrapperFactory} from "./mocks/MockWrapperFactory.sol";
 import {one} from "./helpers/ArrayHelpers.sol";
 
 /// @title DeployTest
-/// @notice The permissionless `deploy(ca, ref, mode)` path: the registration gate (both assets must be
+/// @notice The permissionless `deploy(ca, ref, mode, oracleSalt)` path: the registration gate (both assets must be
 ///         registered), the non-zero return gate, the key-and-mode-keyed recording, the idempotent
 ///         short-circuit, the factory reentrancy path, the US-Dollar bridge wiring, and the event
 ///         surface.
 ///
 ///         IDEMPOTENCY (the reason this suite exists): a wrapper is recorded under
-///         `keccak256(abi.encode(address(this), ca, ref, caSource, refSource))` — the two source
-///         addresses are the ones the requested `OracleMode` actually resolved to, and the registry's
-///         own address keeps a redeployed registry from re-deriving a salt an earlier registry already
-///         spent at the shared factory. A repeat `deploy` that resolves to the same sources returns the
-///         stored address with NO external call, NO write, and NO event. `MarketOracleDeployed` is
-///         emitted ONLY on a fresh deploy.
+///         `wrapperKey(ca, ref, mode)` — a hash of the registry's own address, the pair, the mode and
+///         both legs' FULLY RESOLVED WIRING (vault, sample, feeds, decimals), byte for byte what the
+///         factory is handed. The registry's address keeps a redeployed registry from re-deriving a
+///         salt an earlier registry already spent at the shared factory; the wiring keeps a governance
+///         edit from being served a wrapper it no longer describes. A repeat `deploy` that resolves to
+///         the same wiring returns the stored address with NO factory call, NO write, and NO event.
+///         `MarketOracleDeployed` is emitted ONLY on a fresh deploy.
 ///
 ///         The wrapper factory is the FIRST of the two immutable constructor arguments (there is no
 ///         owner-managed allowlist). `deploy` re-reads each asset's LIVE `decimals()`, and a vault leg
@@ -38,12 +47,11 @@ import {one} from "./helpers/ArrayHelpers.sol";
 ///           dollar path at WRITE time, so an asset whose bridge does not exist can no longer be stored
 ///           at all. Both halves are asserted below — the write-time refusal, and the deploy-time
 ///           failure that is still reachable when the bridge edge is REMOVED after the asset was added.
-///         - `UnsupportedDenomination("GBP")` → `UnregisteredDenomination(label)`, which asks the
-///           registry's denomination store rather than a hard-coded two-string table. It fires at
-///           `addAsset`, and a label can never become unregistered afterwards (registration overwrites
-///           and there is no removal path), so this failure is no longer reachable from `deploy` at all.
-///           The test asserts the write-time refusal and that `deploy` then reports the asset as simply
-///           unknown.
+///         - `UnsupportedDenomination("GBP")` → `UnregisteredDenomination(unit)`, which asks the
+///           registry's denomination set rather than a hard-coded two-string table. It fires at
+///           `addAsset`, and again at `deploy` if the unit is removed after the asset was written.
+///           The tests assert the write-time refusal, that `deploy` then reports the asset as simply
+///           unknown, and the deploy-time refusal after a removal.
 ///
 ///         ## And a sourceless asset is now legal, so `deploy` is the only thing standing in its way
 ///
@@ -65,8 +73,8 @@ contract DeployTest is RegistryFixture {
 
         ca = _newToken("CA", 6);
         ref = _newToken("REF", 18);
-        _addAsset(mkPriceOnlyAsset(ca, "CA", ca, "USD"));
-        _addAsset(mkPriceOnlyAsset(ref, "REF", ref, "USD"));
+        _addAsset(mkPriceOnlyAsset(ca, "CA", ca, USD_UNIT));
+        _addAsset(mkPriceOnlyAsset(ref, "REF", ref, USD_UNIT));
     }
 
     // ── helpers ────────────────────────────────────────────────────────────────
@@ -83,16 +91,21 @@ contract DeployTest is RegistryFixture {
         _addEthUsdFeed();
     }
 
-    /// @dev The deterministic wrapper the mock factory returns for a pair AND a resolved-source pair.
-    ///      The source addresses are part of the salt now, which is exactly why a `NAV` wrapper and a
-    ///      `PRICE` wrapper for one pair no longer collide.
-    function _predict(address ca_, address ref_, address caSource, address refSource) internal view returns (address) {
-        return wrapperFactory.predictWrapperFor(address(iReg), ca_, ref_, caSource, refSource);
+    /// @dev The deterministic wrapper the mock factory returns for a pair and mode, as currently wired,
+    ///      deployed with a zero `oracleSalt`. The salt is the registry's own `wrapperKey` mixed with
+    ///      the caller's salt, read live, so the prediction follows every governance edit the key does.
+    function _predict(address ca_, address ref_, IMarketRegistry.OracleMode mode) internal view returns (address) {
+        return wrapperFactory.predictWrapper(_salted(iReg.wrapperKey(ca_, ref_, mode)));
     }
 
-    /// @dev The price-mode shorthand for the two setUp assets, whose sources are the tokens themselves.
+    /// @dev The factory salt `deploy` derives from a wrapper key and a zero `oracleSalt`.
+    function _salted(bytes32 key) internal pure returns (bytes32) {
+        return keccak256(abi.encode(key, bytes32(0)));
+    }
+
+    /// @dev The price-mode shorthand.
     function _predictPrice(address ca_, address ref_) internal view returns (address) {
-        return _predict(ca_, ref_, ca_, ref_);
+        return _predict(ca_, ref_, IMarketRegistry.OracleMode.PRICE);
     }
 
     // ── deploy_happyPath_recordsAndEmits ─────────────────────────────────────────
@@ -106,7 +119,7 @@ contract DeployTest is RegistryFixture {
         emit IMarketRegistry.MarketOracleDeployed(ca, ref, predicted, IMarketRegistry.OracleMode.PRICE, ca, ref, alice);
 
         vm.prank(alice);
-        address w = iReg.deploy(ca, ref, IMarketRegistry.OracleMode.PRICE);
+        address w = iReg.deploy(ca, ref, IMarketRegistry.OracleMode.PRICE, bytes32(0));
 
         assertEq(w, predicted, "returned wrapper must equal the factory's deterministic address");
         assertEq(
@@ -124,21 +137,21 @@ contract DeployTest is RegistryFixture {
     ///         real factory's `CREATE2` would revert with no error data.
     function test_deploy_secondRegistry_samePair_distinctWrapper() public {
         vm.prank(alice);
-        address first = iReg.deploy(ca, ref, IMarketRegistry.OracleMode.PRICE);
+        address first = iReg.deploy(ca, ref, IMarketRegistry.OracleMode.PRICE, bytes32(0));
 
         // A second registry against the SAME factory, holding the same assets with the same sources.
         MarketRegistry freshReg = new MarketRegistry();
         freshReg.initialize(address(this), address(wrapperFactory), address(fixedRateOracleFactory));
         IMarketRegistry fresh = IMarketRegistry(address(freshReg));
-        fresh.addAssets(one(mkPriceOnlyAsset(ca, "CA", ca, "USD")));
-        fresh.addAssets(one(mkPriceOnlyAsset(ref, "REF", ref, "USD")));
+        fresh.addAssets(one(mkPriceOnlyAsset(ca, "CA", ca, USD_UNIT)));
+        fresh.addAssets(one(mkPriceOnlyAsset(ref, "REF", ref, USD_UNIT)));
 
-        address second = fresh.deploy(ca, ref, IMarketRegistry.OracleMode.PRICE);
+        address second = fresh.deploy(ca, ref, IMarketRegistry.OracleMode.PRICE, bytes32(0));
 
         assertTrue(first != second, "same pair through a second registry must land on a fresh salt");
         assertEq(
             second,
-            wrapperFactory.predictWrapperFor(address(fresh), ca, ref, ca, ref),
+            wrapperFactory.predictWrapper(_salted(fresh.wrapperKey(ca, ref, IMarketRegistry.OracleMode.PRICE))),
             "the second registry's wrapper must be keyed by ITS address"
         );
         // Each registry answers for its own record only.
@@ -154,7 +167,7 @@ contract DeployTest is RegistryFixture {
         address strayRef = makeAddr("strayRef");
         vm.expectRevert(IMarketRegistry.EntryNotFound.selector);
         vm.prank(alice);
-        iReg.deploy(ca, strayRef, IMarketRegistry.OracleMode.PRICE);
+        iReg.deploy(ca, strayRef, IMarketRegistry.OracleMode.PRICE, bytes32(0));
     }
 
     /// @notice An unregistered `ca` reverts `EntryNotFound`.
@@ -162,7 +175,7 @@ contract DeployTest is RegistryFixture {
         address strayCa = makeAddr("strayCa");
         vm.expectRevert(IMarketRegistry.EntryNotFound.selector);
         vm.prank(alice);
-        iReg.deploy(strayCa, ref, IMarketRegistry.OracleMode.PRICE);
+        iReg.deploy(strayCa, ref, IMarketRegistry.OracleMode.PRICE, bytes32(0));
     }
 
     // ── deploy_zeroAddressReturn_revertsNoStateChange (ZeroAddress) ───────────────
@@ -172,7 +185,7 @@ contract DeployTest is RegistryFixture {
 
         vm.expectRevert(IMarketRegistry.ZeroAddress.selector);
         vm.prank(alice);
-        iReg.deploy(ca, ref, IMarketRegistry.OracleMode.PRICE);
+        iReg.deploy(ca, ref, IMarketRegistry.OracleMode.PRICE, bytes32(0));
 
         // No wrapper recorded: the zero-return gate fires before the write.
         assertEq(
@@ -189,14 +202,14 @@ contract DeployTest is RegistryFixture {
         address predicted = _predictPrice(ca, ref);
 
         vm.prank(alice);
-        address first = iReg.deploy(ca, ref, IMarketRegistry.OracleMode.PRICE);
+        address first = iReg.deploy(ca, ref, IMarketRegistry.OracleMode.PRICE, bytes32(0));
         assertEq(first, predicted, "first deploy address");
         assertEq(iReg.lookupWrapper(ca, ref, IMarketRegistry.OracleMode.PRICE), first, "recorded after first deploy");
 
         // Repeat with the SAME pair and mode but a different caller.
         vm.recordLogs();
         vm.prank(bob);
-        address second = iReg.deploy(ca, ref, IMarketRegistry.OracleMode.PRICE);
+        address second = iReg.deploy(ca, ref, IMarketRegistry.OracleMode.PRICE, bytes32(0));
         Vm.Log[] memory logs = vm.getRecordedLogs();
 
         assertEq(second, first, "repeat must return the SAME recorded address");
@@ -210,15 +223,16 @@ contract DeployTest is RegistryFixture {
     ///         already recorded. Re-listing the asset with the same source restores the recorded wrapper
     ///         unchanged — the record itself was never touched.
     /// @dev This is the OPPOSITE of the predecessor's behaviour, and the reversal is forced rather than
-    ///      incidental. The wrapper key is derived from the two RESOLVED SOURCE ADDRESSES now, so there is
-    ///      no key to look up until both legs have been resolved: the short-circuit cannot precede
-    ///      resolution any more. The consequence worth pinning is that withdrawing approval actually
+    ///      incidental. The wrapper key is derived from the fully resolved wiring, so there is no key to
+    ///      look up until both legs have been resolved: the short-circuit cannot precede resolution.
+    ///      Re-listing with the SAME source resolves to identical wiring and therefore the identical
+    ///      key, which is why the record reappears. The consequence worth pinning is that withdrawing approval actually
     ///      withdraws it — a de-listed asset stops answering through `deploy` and `lookupWrapper` — while
     ///      the historical record survives, because removal withdraws approval rather than unwinding
     ///      history.
     function test_deploy_delistedAsset_repeatRevertsEntryNotFound() public {
         vm.prank(alice);
-        address w = iReg.deploy(ca, ref, IMarketRegistry.OracleMode.PRICE);
+        address w = iReg.deploy(ca, ref, IMarketRegistry.OracleMode.PRICE, bytes32(0));
 
         vm.prank(owner);
         iReg.removeAssets(one(ca));
@@ -226,7 +240,7 @@ contract DeployTest is RegistryFixture {
         // The repeat no longer short-circuits: resolution comes first and fails.
         vm.expectRevert(IMarketRegistry.EntryNotFound.selector);
         vm.prank(bob);
-        iReg.deploy(ca, ref, IMarketRegistry.OracleMode.PRICE);
+        iReg.deploy(ca, ref, IMarketRegistry.OracleMode.PRICE, bytes32(0));
 
         // And the read agrees, without reverting.
         assertEq(
@@ -237,7 +251,7 @@ contract DeployTest is RegistryFixture {
 
         // Re-listing with the SAME source resolves to the same key, so the untouched record reappears and
         // a further deploy is once again a silent no-op.
-        _addAsset(mkPriceOnlyAsset(ca, "CA", ca, "USD"));
+        _addAsset(mkPriceOnlyAsset(ca, "CA", ca, USD_UNIT));
         assertEq(
             iReg.lookupWrapper(ca, ref, IMarketRegistry.OracleMode.PRICE),
             w,
@@ -246,7 +260,7 @@ contract DeployTest is RegistryFixture {
 
         vm.recordLogs();
         vm.prank(bob);
-        address again = iReg.deploy(ca, ref, IMarketRegistry.OracleMode.PRICE);
+        address again = iReg.deploy(ca, ref, IMarketRegistry.OracleMode.PRICE, bytes32(0));
         Vm.Log[] memory logs = vm.getRecordedLogs();
 
         assertEq(again, w, "the re-listed pair must short-circuit onto the original wrapper");
@@ -261,8 +275,8 @@ contract DeployTest is RegistryFixture {
         // A second registered pair for the nested deploy.
         address ca2 = _newToken("CA2", 8);
         address ref2 = _newToken("REF2", 8);
-        _addAsset(mkPriceOnlyAsset(ca2, "CA2", ca2, "USD"));
-        _addAsset(mkPriceOnlyAsset(ref2, "REF2", ref2, "USD"));
+        _addAsset(mkPriceOnlyAsset(ca2, "CA2", ca2, USD_UNIT));
+        _addAsset(mkPriceOnlyAsset(ref2, "REF2", ref2, USD_UNIT));
 
         address shared = makeAddr("sharedWrapper");
         wrapperFactory.configureReentrant(
@@ -271,7 +285,7 @@ contract DeployTest is RegistryFixture {
 
         vm.recordLogs();
         vm.prank(alice);
-        address w = iReg.deploy(ca, ref, IMarketRegistry.OracleMode.PRICE);
+        address w = iReg.deploy(ca, ref, IMarketRegistry.OracleMode.PRICE, bytes32(0));
         Vm.Log[] memory logs = vm.getRecordedLogs();
 
         // Observed FROM INSIDE the factory call: the outer pair had not been recorded yet.
@@ -280,7 +294,7 @@ contract DeployTest is RegistryFixture {
             "outer deploy recorded its pair before the factory call (partial state)"
         );
 
-        // Net effect: both keys record the same wrapper address (wrappers are keyed by pair + sources).
+        // Net effect: both keys record the same wrapper address (wrappers are keyed by pair, mode and wiring).
         assertEq(w, shared, "outer must return the reentrant factory's address");
         assertEq(iReg.lookupWrapper(ca, ref, IMarketRegistry.OracleMode.PRICE), shared, "outer pair must be recorded");
         assertEq(
@@ -302,12 +316,12 @@ contract DeployTest is RegistryFixture {
 
     function test_deploy_distinctPairs_recordTwoWrappers() public {
         address third = _newToken("THIRD", 18);
-        _addAsset(mkPriceOnlyAsset(third, "THIRD", third, "USD"));
+        _addAsset(mkPriceOnlyAsset(third, "THIRD", third, USD_UNIT));
 
         vm.prank(alice);
-        address first = iReg.deploy(ca, ref, IMarketRegistry.OracleMode.PRICE);
+        address first = iReg.deploy(ca, ref, IMarketRegistry.OracleMode.PRICE, bytes32(0));
         vm.prank(alice);
-        address second = iReg.deploy(ca, third, IMarketRegistry.OracleMode.PRICE);
+        address second = iReg.deploy(ca, third, IMarketRegistry.OracleMode.PRICE, bytes32(0));
 
         assertTrue(first != second, "distinct pairs must land at distinct wrappers");
         assertEq(iReg.lookupWrapper(ca, ref, IMarketRegistry.OracleMode.PRICE), first, "first pair recorded");
@@ -322,7 +336,7 @@ contract DeployTest is RegistryFixture {
         wrapperFactory.setFixedWrapper(chosen);
 
         vm.prank(alice);
-        address returned = iReg.deploy(ca, ref, IMarketRegistry.OracleMode.PRICE);
+        address returned = iReg.deploy(ca, ref, IMarketRegistry.OracleMode.PRICE, bytes32(0));
 
         assertEq(returned, chosen, "registry records the factory's arbitrary return verbatim");
         assertEq(
@@ -342,12 +356,12 @@ contract DeployTest is RegistryFixture {
         vm.expectEmit(true, true, true, true, address(reg));
         emit IMarketRegistry.MarketOracleDeployed(ca, ref, predicted, IMarketRegistry.OracleMode.PRICE, ca, ref, alice);
         vm.prank(alice);
-        address a = iReg.deploy(ca, ref, IMarketRegistry.OracleMode.PRICE);
+        address a = iReg.deploy(ca, ref, IMarketRegistry.OracleMode.PRICE, bytes32(0));
 
         // Second caller short-circuits: same address, no event.
         vm.recordLogs();
         vm.prank(bob);
-        address b = iReg.deploy(ca, ref, IMarketRegistry.OracleMode.PRICE);
+        address b = iReg.deploy(ca, ref, IMarketRegistry.OracleMode.PRICE, bytes32(0));
         Vm.Log[] memory logs = vm.getRecordedLogs();
 
         assertEq(a, b, "both callers must resolve to the same wrapper");
@@ -363,7 +377,7 @@ contract DeployTest is RegistryFixture {
 
         uint256 snap = vm.snapshotState();
         vm.prank(alice);
-        address previewed = iReg.deploy(ca, ref, IMarketRegistry.OracleMode.PRICE);
+        address previewed = iReg.deploy(ca, ref, IMarketRegistry.OracleMode.PRICE, bytes32(0));
         assertEq(previewed, predicted, "simulated deploy must return the deterministic address");
         vm.revertToState(snap);
 
@@ -376,7 +390,7 @@ contract DeployTest is RegistryFixture {
 
         // The real call yields the exact address the preview predicted.
         vm.prank(alice);
-        address actual = iReg.deploy(ca, ref, IMarketRegistry.OracleMode.PRICE);
+        address actual = iReg.deploy(ca, ref, IMarketRegistry.OracleMode.PRICE, bytes32(0));
         assertEq(actual, previewed, "real deploy must match the previewed address");
         assertEq(
             iReg.lookupWrapper(ca, ref, IMarketRegistry.OracleMode.PRICE), actual, "real deploy records the wrapper"
@@ -389,7 +403,7 @@ contract DeployTest is RegistryFixture {
         wrapperFactory.setMode(MockWrapperFactory.Mode.Revert);
         vm.expectRevert(MockWrapperFactory.FactoryReverted.selector);
         vm.prank(alice);
-        iReg.deploy(ca, ref, IMarketRegistry.OracleMode.PRICE);
+        iReg.deploy(ca, ref, IMarketRegistry.OracleMode.PRICE, bytes32(0));
     }
 
     // ── sourceless legs: MissingSource in BOTH oracle modes ───────────────────────
@@ -409,14 +423,14 @@ contract DeployTest is RegistryFixture {
             abi.encodeWithSelector(IMarketRegistry.MissingSource.selector, bare, IMarketRegistry.OracleMode.PRICE)
         );
         vm.prank(alice);
-        iReg.deploy(bare, ref, IMarketRegistry.OracleMode.PRICE);
+        iReg.deploy(bare, ref, IMarketRegistry.OracleMode.PRICE, bytes32(0));
 
         // And as the reference leg.
         vm.expectRevert(
             abi.encodeWithSelector(IMarketRegistry.MissingSource.selector, bare, IMarketRegistry.OracleMode.PRICE)
         );
         vm.prank(alice);
-        iReg.deploy(ca, bare, IMarketRegistry.OracleMode.PRICE);
+        iReg.deploy(ca, bare, IMarketRegistry.OracleMode.PRICE, bytes32(0));
 
         assertEq(
             iReg.lookupWrapper(bare, ref, IMarketRegistry.OracleMode.PRICE),
@@ -441,14 +455,14 @@ contract DeployTest is RegistryFixture {
         _addAsset(mkSourcelessAsset(bare, "BARE"));
 
         address vaultRef = _newToken("VREF", 18);
-        _addAsset(mkNavOnlyAsset(vaultRef, "VREF", vaultRef, "USD"));
+        _addAsset(mkNavOnlyAsset(vaultRef, "VREF", vaultRef, USD_UNIT));
 
         // Against a leg that DOES have a NAV source: the sourceless leg is the only possible failure.
         vm.expectRevert(
             abi.encodeWithSelector(IMarketRegistry.MissingSource.selector, bare, IMarketRegistry.OracleMode.NAV)
         );
         vm.prank(alice);
-        iReg.deploy(bare, vaultRef, IMarketRegistry.OracleMode.NAV);
+        iReg.deploy(bare, vaultRef, IMarketRegistry.OracleMode.NAV, bytes32(0));
 
         // Against a price-only leg: per-leg selection still fires first, so this is MissingSource and NOT
         // NavModeWithoutNavSource.
@@ -456,7 +470,7 @@ contract DeployTest is RegistryFixture {
             abi.encodeWithSelector(IMarketRegistry.MissingSource.selector, bare, IMarketRegistry.OracleMode.NAV)
         );
         vm.prank(alice);
-        iReg.deploy(bare, ref, IMarketRegistry.OracleMode.NAV);
+        iReg.deploy(bare, ref, IMarketRegistry.OracleMode.NAV, bytes32(0));
 
         assertEq(
             iReg.lookupWrapper(bare, vaultRef, IMarketRegistry.OracleMode.NAV),
@@ -474,7 +488,7 @@ contract DeployTest is RegistryFixture {
     ///         asserted explicitly so a regression in the US-Dollar branch cannot hide.
     function test_deploy_usdUsdPair_bothFeed2Zero() public {
         vm.prank(alice);
-        iReg.deploy(ca, ref, IMarketRegistry.OracleMode.PRICE);
+        iReg.deploy(ca, ref, IMarketRegistry.OracleMode.PRICE, bytes32(0));
 
         assertEq(wrapperFactory.lastBaseFeed2(), address(0), "USD REF must wire baseFeed2 = address(0)");
         assertEq(wrapperFactory.lastQuoteFeed2(), address(0), "USD CA must wire quoteFeed2 = address(0)");
@@ -493,10 +507,10 @@ contract DeployTest is RegistryFixture {
     function test_deploy_ethRef_usdCa_bridgesBaseFeed2() public {
         _addEthUsdEdgeAsOwner();
         address ethRef = _newToken("ETHREF", 18);
-        _addAsset(mkPriceOnlyAsset(ethRef, "ETHREF", ethRef, "ETH"));
+        _addAsset(mkPriceOnlyAsset(ethRef, "ETHREF", ethRef, ETH_UNIT));
 
         vm.prank(alice);
-        iReg.deploy(ca, ethRef, IMarketRegistry.OracleMode.PRICE);
+        iReg.deploy(ca, ethRef, IMarketRegistry.OracleMode.PRICE, bytes32(0));
 
         assertEq(
             wrapperFactory.lastBaseFeed2(), ethUsdAggregator, "ETH REF must bridge baseFeed2 to the ETH/USD aggregator"
@@ -512,11 +526,11 @@ contract DeployTest is RegistryFixture {
         _addEthUsdEdgeAsOwner();
         address ethRef = _newToken("ETHREF", 18);
         address ethCa = _newToken("ETHCA", 6);
-        _addAsset(mkPriceOnlyAsset(ethRef, "ETHREF", ethRef, "ETH"));
-        _addAsset(mkPriceOnlyAsset(ethCa, "ETHCA", ethCa, "ETH"));
+        _addAsset(mkPriceOnlyAsset(ethRef, "ETHREF", ethRef, ETH_UNIT));
+        _addAsset(mkPriceOnlyAsset(ethCa, "ETHCA", ethCa, ETH_UNIT));
 
         vm.prank(alice);
-        iReg.deploy(ethCa, ethRef, IMarketRegistry.OracleMode.PRICE);
+        iReg.deploy(ethCa, ethRef, IMarketRegistry.OracleMode.PRICE, bytes32(0));
 
         assertEq(
             wrapperFactory.lastBaseFeed2(), ethUsdAggregator, "ETH REF must bridge baseFeed2 to the ETH/USD aggregator"
@@ -546,12 +560,12 @@ contract DeployTest is RegistryFixture {
         address ethRef = _newToken("ETHREF", 18);
 
         vm.expectRevert(abi.encodeWithSelector(IMarketRegistry.NoConversionPathToUsd.selector, ETH_UNIT, uint256(1)));
-        _addAsset(mkPriceOnlyAsset(ethRef, "ETHREF", ethRef, "ETH"));
+        _addAsset(mkPriceOnlyAsset(ethRef, "ETHREF", ethRef, ETH_UNIT));
 
         // Nothing was stored, so the pair is simply unknown to `deploy`.
         vm.expectRevert(IMarketRegistry.EntryNotFound.selector);
         vm.prank(alice);
-        iReg.deploy(ca, ethRef, IMarketRegistry.OracleMode.PRICE);
+        iReg.deploy(ca, ethRef, IMarketRegistry.OracleMode.PRICE, bytes32(0));
     }
 
     /// @notice `MissingConversionFeed` case, part 2 of 2 — the deploy-time failure that IS still
@@ -565,7 +579,7 @@ contract DeployTest is RegistryFixture {
     function test_deploy_bridgeFeedRemoved_revertsNoConversionPathToUsd() public {
         _addEthUsdEdgeAsOwner();
         address ethRef = _newToken("ETHREF", 18);
-        _addAsset(mkPriceOnlyAsset(ethRef, "ETHREF", ethRef, "ETH"));
+        _addAsset(mkPriceOnlyAsset(ethRef, "ETHREF", ethRef, ETH_UNIT));
 
         // Withdraw the only ETH → USD edge. No cascade: the asset entry stays.
         vm.prank(owner);
@@ -575,7 +589,7 @@ contract DeployTest is RegistryFixture {
 
         vm.expectRevert(abi.encodeWithSelector(IMarketRegistry.NoConversionPathToUsd.selector, ETH_UNIT, uint256(1)));
         vm.prank(alice);
-        iReg.deploy(ca, ethRef, IMarketRegistry.OracleMode.PRICE);
+        iReg.deploy(ca, ethRef, IMarketRegistry.OracleMode.PRICE, bytes32(0));
 
         assertEq(wrapperFactory.callCount(), 0, "resolution must fail BEFORE the factory is called");
         assertEq(
@@ -585,41 +599,229 @@ contract DeployTest is RegistryFixture {
         );
     }
 
-    /// @notice `UnsupportedDenomination` case — replaced by `UnregisteredDenomination(label)` at WRITE
-    ///         time. A source naming a label the registry has never registered ("GBP") is refused by
+    /// @notice `UnsupportedDenomination` case — replaced by `UnregisteredDenomination(unit)` at WRITE
+    ///         time. A source quoting a unit the registry has never registered is refused by
     ///         `addAsset`, so the asset does not exist and `deploy` reports `EntryNotFound`.
     /// @dev This replaces `test_deploy_unrecognizedDenomination_revertsUnsupportedDenomination`. The old
-    ///      error asked "is this one of two hard-coded strings"; the new one asks "is this label in the
-    ///      registry's denomination store", which is a governed set the owner maintains. It cannot be
-    ///      asserted at `deploy` time any more, and that is a fact about the design rather than a gap in
-    ///      the test: `registerDenomination` OVERWRITES and there is no removal path, so a label that was
-    ///      registered when the asset was written can never become unregistered afterwards. Write time is
-    ///      the only place this failure exists. Registering the label — with a dollar edge — makes the very
-    ///      same asset acceptable, which is asserted below so the test says what the rule IS and not only
-    ///      what it forbids.
+    ///      error asked "is this one of two hard-coded strings"; the new one asks "is this unit in the
+    ///      registry's denomination set", which is a governed set the owner maintains. Registering the
+    ///      unit — with a dollar edge — makes the very same asset acceptable, which is asserted below so
+    ///      the test says what the rule IS and not only what it forbids.
     function test_addAssets_unregisteredDenomination_revertsUnregisteredDenomination() public {
         address gbpRef = _newToken("GBPREF", 18);
+        address gbpUnit = makeAddr("gbpUnit");
 
-        vm.expectRevert(abi.encodeWithSelector(IMarketRegistry.UnregisteredDenomination.selector, "GBP"));
-        _addAsset(mkPriceOnlyAsset(gbpRef, "GBPREF", gbpRef, "GBP"));
+        vm.expectRevert(abi.encodeWithSelector(IMarketRegistry.UnregisteredDenomination.selector, gbpUnit));
+        _addAsset(mkPriceOnlyAsset(gbpRef, "GBPREF", gbpRef, gbpUnit));
 
         vm.expectRevert(IMarketRegistry.EntryNotFound.selector);
         vm.prank(alice);
-        iReg.deploy(ca, gbpRef, IMarketRegistry.OracleMode.PRICE);
+        iReg.deploy(ca, gbpRef, IMarketRegistry.OracleMode.PRICE, bytes32(0));
 
-        // Register the label and give it a dollar edge, and the identical entry is accepted and deployable.
-        address gbpUnit = makeAddr("gbpUnit");
+        // Register the unit and give it a dollar edge, and the identical entry is accepted and deployable.
         address gbpUsdAgg = makeAddr("gbpUsdAggregator");
-        // Two owner writes in one helper (the label and its dollar edge), so this needs a start/stop
+        // Two owner writes in one helper (the unit and its dollar edge), so this needs a start/stop
         // prank rather than a single-call `vm.prank`.
         vm.startPrank(owner);
-        _registerDenominationWithUsdFeed("GBP", gbpUnit, gbpUsdAgg);
+        _registerDenominationWithUsdFeed(gbpUnit, gbpUsdAgg);
         vm.stopPrank();
-        _addAsset(mkPriceOnlyAsset(gbpRef, "GBPREF", gbpRef, "GBP"));
+        _addAsset(mkPriceOnlyAsset(gbpRef, "GBPREF", gbpRef, gbpUnit));
 
         vm.prank(alice);
-        iReg.deploy(ca, gbpRef, IMarketRegistry.OracleMode.PRICE);
-        assertEq(wrapperFactory.lastBaseFeed2(), gbpUsdAgg, "the newly registered label must bridge through its edge");
+        iReg.deploy(ca, gbpRef, IMarketRegistry.OracleMode.PRICE, bytes32(0));
+        assertEq(wrapperFactory.lastBaseFeed2(), gbpUsdAgg, "the newly registered unit must bridge through its edge");
+    }
+
+    // ── the key covers the wiring: a governance edit re-keys a deployed pair ──────
+    // The wrapper record is keyed on `wrapperKey(ca, ref, mode)`, a hash of the mode and both legs'
+    // fully resolved wiring. A repeat `deploy` therefore never short-circuits onto a wrapper built for
+    // wiring governance has since withdrawn or replaced: it re-resolves first, and either fails the way
+    // a first deploy would, or lands on a fresh key and rebuilds. The control case at the end pins the
+    // other half — wiring that did not change still hits the cache and makes no second factory call.
+
+    /// @notice Regression: the wrapper cache key covers the oracle mode and the resolved wiring.
+    ///         After a pair is deployed, removing the bridge edge its reference leg
+    ///         depends on makes a REPEAT `deploy` revert `NoConversionPathToUsd`, instead of serving the
+    ///         cached wrapper that was wired through the withdrawn feed.
+    /// @dev Fails at the base commit: there the key was derived from the resolved SOURCE addresses
+    ///      before any wiring, so the second call short-circuited onto the stale wrapper.
+    function test_deploy_bridgeFeedRemovedAfterDeploy_repeatRevertsNoConversionPathToUsd() public {
+        _addEthUsdEdgeAsOwner();
+        address ethRef = _newToken("ETHREF", 18);
+        _addAsset(mkPriceOnlyAsset(ethRef, "ETHREF", ethRef, ETH_UNIT));
+
+        vm.prank(alice);
+        address w = iReg.deploy(ca, ethRef, IMarketRegistry.OracleMode.PRICE, bytes32(0));
+        assertTrue(w != address(0), "first deploy must build");
+        assertEq(wrapperFactory.lastBaseFeed2(), ethUsdAggregator, "first deploy wires the ETH/USD bridge");
+
+        vm.prank(owner);
+        iReg.removeConversionFeeds(one(ETH_UNIT), one(USD_UNIT));
+
+        vm.expectRevert(abi.encodeWithSelector(IMarketRegistry.NoConversionPathToUsd.selector, ETH_UNIT, uint256(1)));
+        vm.prank(bob);
+        iReg.deploy(ca, ethRef, IMarketRegistry.OracleMode.PRICE, bytes32(0));
+
+        assertEq(
+            iReg.lookupWrapper(ca, ethRef, IMarketRegistry.OracleMode.PRICE),
+            address(0),
+            "the stale wrapper must not be readable through the lookup either"
+        );
+        assertEq(wrapperFactory.callCount(), 1, "the repeat fails in resolution, before the factory");
+    }
+
+    /// @notice Regression: the wrapper cache key covers the oracle mode and the resolved wiring.
+    ///         Removing the UNIT a deployed leg's source quotes in makes a repeat
+    ///         `deploy` and `wrapperKey` revert `UnregisteredDenomination(unit)`, and `lookupWrapper`
+    ///         read the zero address.
+    /// @dev Fails at the base commit for the same reason as the feed case above.
+    function test_deploy_denominationRemovedAfterDeploy_repeatRevertsUnregisteredDenomination() public {
+        address gbpUnit = makeAddr("gbpUnit");
+        vm.startPrank(owner);
+        _registerDenominationWithUsdFeed(gbpUnit, makeAddr("gbpUsdAggregator"));
+        vm.stopPrank();
+        address gbpRef = _newToken("GBPREF", 18);
+        _addAsset(mkPriceOnlyAsset(gbpRef, "GBPREF", gbpRef, gbpUnit));
+
+        vm.prank(alice);
+        address wrapper = iReg.deploy(ca, gbpRef, IMarketRegistry.OracleMode.PRICE, bytes32(0));
+        assertEq(iReg.lookupWrapper(ca, gbpRef, IMarketRegistry.OracleMode.PRICE), wrapper, "setup: wrapper recorded");
+
+        vm.prank(owner);
+        iReg.removeDenominations(one(gbpUnit));
+
+        vm.expectRevert(abi.encodeWithSelector(IMarketRegistry.UnregisteredDenomination.selector, gbpUnit));
+        vm.prank(bob);
+        iReg.deploy(ca, gbpRef, IMarketRegistry.OracleMode.PRICE, bytes32(0));
+
+        vm.expectRevert(abi.encodeWithSelector(IMarketRegistry.UnregisteredDenomination.selector, gbpUnit));
+        iReg.wrapperKey(ca, gbpRef, IMarketRegistry.OracleMode.PRICE);
+
+        assertEq(iReg.lookupWrapper(ca, gbpRef, IMarketRegistry.OracleMode.PRICE), address(0), "no wrapper to read");
+        assertEq(wrapperFactory.callCount(), 1, "the repeat fails in resolution, before the factory");
+    }
+
+    /// @notice Regression: the wrapper cache key covers the oracle mode and the resolved wiring.
+    ///         A bridge feed removed and re-added against a NEW aggregator re-keys
+    ///         the pair: the next `deploy` makes a second factory call, wires the new aggregator, lands
+    ///         on a new wrapper, and `lookupWrapper` follows it.
+    /// @dev Fails at the base commit, where the second call returned the first wrapper untouched.
+    function test_deploy_bridgeFeedReplacedAfterDeploy_rekeysAndRebuilds() public {
+        _addEthUsdEdgeAsOwner();
+        address ethRef = _newToken("ETHREF", 18);
+        _addAsset(mkPriceOnlyAsset(ethRef, "ETHREF", ethRef, ETH_UNIT));
+
+        vm.prank(alice);
+        address first = iReg.deploy(ca, ethRef, IMarketRegistry.OracleMode.PRICE, bytes32(0));
+        bytes32 firstKey = wrapperFactory.lastWrapperSalt();
+
+        address newAggregator = makeAddr("ethUsdAggregatorV2");
+        vm.startPrank(owner);
+        iReg.removeConversionFeeds(one(ETH_UNIT), one(USD_UNIT));
+        _addFeed(ETH_UNIT, USD_UNIT, newAggregator);
+        vm.stopPrank();
+
+        address predicted = _predictPrice(ca, ethRef);
+        vm.expectEmit(true, true, true, true, address(reg));
+        emit IMarketRegistry.MarketOracleDeployed(
+            ca, ethRef, predicted, IMarketRegistry.OracleMode.PRICE, ca, ethRef, bob
+        );
+        vm.prank(bob);
+        address second = iReg.deploy(ca, ethRef, IMarketRegistry.OracleMode.PRICE, bytes32(0));
+
+        assertEq(wrapperFactory.callCount(), 2, "the re-pointed feed must reach the factory again");
+        assertEq(wrapperFactory.lastBaseFeed2(), newAggregator, "the rebuilt wrapper wires the NEW aggregator");
+        assertTrue(second != first, "new wiring, new wrapper");
+        assertTrue(wrapperFactory.lastWrapperSalt() != firstKey, "new wiring, new key");
+        assertEq(second, predicted, "and the key predicts it");
+        assertEq(iReg.lookupWrapper(ca, ethRef, IMarketRegistry.OracleMode.PRICE), second, "the lookup follows the key");
+    }
+
+    /// @notice Regression: the wrapper cache key covers the oracle mode and the resolved wiring.
+    ///         An asset naming ONE address in both its PRICE and NAV slots gets one
+    ///         wrapper per mode, from two factory calls, because the mode is in the key.
+    /// @dev Fails at the base commit: both modes resolved to the same source addresses, so the NAV
+    ///      call returned the PRICE wrapper. The NAV slot declares `AGGREGATOR_V3`, the shape the enums
+    ///      exist to keep representable — an aggregator publishing an exchange rate.
+    function test_deploy_sameSourceInBothSlots_oneWrapperPerMode() public {
+        address twin = _newToken("TWIN", 18);
+        _addAsset(
+            mkAsset(
+                twin,
+                "TWIN",
+                IMarketRegistry.AssetKind.ERC20,
+                mkPriceSource(twin, USD_UNIT),
+                mkSource(twin, IMarketRegistry.SourceType.NAV, IMarketRegistry.SourceInterface.AGGREGATOR_V3, USD_UNIT)
+            )
+        );
+
+        vm.prank(alice);
+        address priceWrapper = iReg.deploy(ca, twin, IMarketRegistry.OracleMode.PRICE, bytes32(0));
+        vm.prank(alice);
+        address navWrapper = iReg.deploy(ca, twin, IMarketRegistry.OracleMode.NAV, bytes32(0));
+
+        assertEq(wrapperFactory.callCount(), 2, "one factory call per mode");
+        assertTrue(priceWrapper != navWrapper, "the two modes must not collapse onto one wrapper");
+        assertTrue(
+            iReg.wrapperKey(ca, twin, IMarketRegistry.OracleMode.PRICE)
+                != iReg.wrapperKey(ca, twin, IMarketRegistry.OracleMode.NAV),
+            "the mode is part of the key"
+        );
+        assertEq(iReg.lookupWrapper(ca, twin, IMarketRegistry.OracleMode.PRICE), priceWrapper);
+        assertEq(iReg.lookupWrapper(ca, twin, IMarketRegistry.OracleMode.NAV), navWrapper);
+    }
+
+    /// @notice CONTROL for the four cases above: a repeat `deploy` whose wiring did not change hits the
+    ///         cache — same wrapper, no second factory call, no event.
+    /// @dev Passes at the base commit as well; it is here to show the re-keying is exactly as fine as
+    ///      the wiring and no finer. The pair bridges through a feed so the repeat re-walks the path.
+    function test_deploy_repeat_unchangedWiring_control_hitsCacheNoSecondFactoryCall() public {
+        _addEthUsdEdgeAsOwner();
+        address ethRef = _newToken("ETHREF", 18);
+        _addAsset(mkPriceOnlyAsset(ethRef, "ETHREF", ethRef, ETH_UNIT));
+
+        vm.prank(alice);
+        address first = iReg.deploy(ca, ethRef, IMarketRegistry.OracleMode.PRICE, bytes32(0));
+
+        vm.recordLogs();
+        vm.prank(bob);
+        address second = iReg.deploy(ca, ethRef, IMarketRegistry.OracleMode.PRICE, bytes32(0));
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+
+        assertEq(second, first, "unchanged wiring must return the recorded wrapper");
+        assertEq(wrapperFactory.callCount(), 1, "unchanged wiring must not reach the factory again");
+        assertFalse(_sawDeployed(logs), "a cache hit emits nothing");
+    }
+
+    // ── wrapperKey: the view behind the salt ─────────────────────────────────────
+
+    /// @notice `wrapperKey` mixed with the caller's `oracleSalt` is the salt the factory receives — both
+    ///         salts — and a deploy does not move the key.
+    function test_wrapperKey_seedsTheSaltHandedToTheFactory() public {
+        bytes32 before = iReg.wrapperKey(ca, ref, IMarketRegistry.OracleMode.PRICE);
+        bytes32 oracleSalt = keccak256("maker salt");
+        bytes32 expected = keccak256(abi.encode(before, oracleSalt));
+
+        vm.prank(alice);
+        iReg.deploy(ca, ref, IMarketRegistry.OracleMode.PRICE, oracleSalt);
+
+        assertEq(wrapperFactory.lastWrapperSalt(), expected, "the wrapper salt is the key mixed with the caller's salt");
+        assertEq(wrapperFactory.lastMorphoSalt(), expected, "the oracle salt is the key mixed with the caller's salt");
+        assertEq(iReg.wrapperKey(ca, ref, IMarketRegistry.OracleMode.PRICE), before, "a deploy does not move the key");
+    }
+
+    /// @notice `wrapperKey` reverts exactly as `deploy` would for a pair that cannot be built, while
+    ///         `lookupWrapper` turns the same condition into the zero address.
+    function test_wrapperKey_undeployablePair_revertsWhereLookupReadsZero() public {
+        address stray = makeAddr("stray");
+        vm.expectRevert(IMarketRegistry.EntryNotFound.selector);
+        iReg.wrapperKey(ca, stray, IMarketRegistry.OracleMode.PRICE);
+        assertEq(iReg.lookupWrapper(ca, stray, IMarketRegistry.OracleMode.PRICE), address(0));
+
+        // NAV mode over two price-only legs: the cross-leg guard, through the same view.
+        vm.expectRevert(abi.encodeWithSelector(IMarketRegistry.NavModeWithoutNavSource.selector, ca, ref));
+        iReg.wrapperKey(ca, ref, IMarketRegistry.OracleMode.NAV);
+        assertEq(iReg.lookupWrapper(ca, ref, IMarketRegistry.OracleMode.NAV), address(0));
     }
 
     // ── shared log scan ──────────────────────────────────────────────────────────

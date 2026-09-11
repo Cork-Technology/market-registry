@@ -96,19 +96,19 @@ contract AssetStoreTest is Test {
         tokenA = address(new MockERC20("Token A", "AAA", 6));
         tokenB = address(new MockERC20("Token B", "BBB", 18));
 
-        // "USD" and "ETH" are seeded by the constructor. "GBP" is registered but deliberately has no
-        // path to US Dollars, which is what makes it the one case that separates "nobody governs that
-        // label" from "the label is fine, the graph cannot carry it to US Dollars".
+        // US Dollars and Ether are seeded by `initialize`. `GBP_UNIT` is registered but deliberately
+        // has no path to US Dollars, which is what makes it the one case that separates "nobody
+        // governs that unit" from "the unit is fine, the graph cannot carry it to US Dollars".
         vm.prank(owner);
-        reg.addDenominations(one("GBP"), one(GBP_UNIT));
+        reg.addDenominations(one(GBP_UNIT));
 
-        // The one bridge edge this suite needs: without it an "ETH"-quoted source is unwritable, so the
+        // The one bridge edge this suite needs: without it an Ether-quoted source is unwritable, so the
         // edit and mixed-denomination cases below could not use Ether as their second unit.
         vm.prank(owner);
         reg.addConversionFeeds(
             one(
                 IMarketRegistry.ConversionFeed({
-                    base: ETH_UNIT, quote: USD_UNIT, aggregatorAddress: makeAddr("ethUsdAggregator"), feedDecimals: 8
+                    base: ETH_UNIT, quote: USD_UNIT, aggregatorAddress: makeAddr("ethUsdAggregator")
                 })
             )
         );
@@ -116,11 +116,11 @@ contract AssetStoreTest is Test {
 
     // ── helpers ──────────────────────────────────────────────────────────────
 
-    /// @dev A structurally-valid asset: one price source quoting "USD" (zero bridge hops), NAV slot
+    /// @dev A structurally-valid asset: one price source quoting US Dollars (zero bridge hops), NAV slot
     ///      absent. There is no asset-level denomination argument any more, because there is no
     ///      asset-level denomination FIELD any more.
     function _asset(address addr_, string memory name_) internal pure returns (IMarketRegistry.Asset memory) {
-        return mkPriceOnlyAsset(addr_, name_, SRC, "USD");
+        return mkPriceOnlyAsset(addr_, name_, SRC, USD_UNIT);
     }
 
     function _keyHash(address addr_) internal pure returns (bytes32) {
@@ -138,12 +138,8 @@ contract AssetStoreTest is Test {
 
     /// @dev The stored `denomination` of ONE of a stored asset's two source slots. Which slot is a
     ///      required argument, because "the asset's denomination" is no longer a question with a single
-    ///      answer. An ABSENT slot reads back as the empty string.
-    function _sourceDenomination(address addr_, IMarketRegistry.SourceType which)
-        internal
-        view
-        returns (string memory)
-    {
+    ///      answer. An ABSENT slot reads back as the zero address.
+    function _sourceDenomination(address addr_, IMarketRegistry.SourceType which) internal view returns (address) {
         (bool found, IMarketRegistry.Asset memory got) = reg.lookupAssetByAddress(addr_);
         require(found, "asset not stored");
         return which == IMarketRegistry.SourceType.PRICE ? got.priceSource.denomination : got.navSource.denomination;
@@ -182,7 +178,7 @@ contract AssetStoreTest is Test {
         assertEq(uint256(uint8(got.kind)), uint256(uint8(IMarketRegistry.AssetKind.ERC20)), "kind mismatch");
         // The price slot is filled, and its denomination is stored VERBATIM — not derived, not rewritten.
         assertEq(got.priceSource.addr, SRC, "price source addr mismatch");
-        assertEq(got.priceSource.denomination, "USD", "price source denomination not stored verbatim");
+        assertEq(got.priceSource.denomination, USD_UNIT, "price source denomination not stored verbatim");
         assertEq(
             uint256(uint8(got.priceSource.sourceType)),
             uint256(uint8(IMarketRegistry.SourceType.PRICE)),
@@ -190,7 +186,7 @@ contract AssetStoreTest is Test {
         );
         // The NAV slot is absent: zeroed, string included.
         assertEq(got.navSource.addr, address(0), "absent NAV slot should be zeroed");
-        assertEq(got.navSource.denomination, "", "absent NAV slot should have no denomination");
+        assertEq(got.navSource.denomination, address(0), "absent NAV slot should have no denomination");
 
         // Retrievable by name (secondary index populated).
         (bool foundN, IMarketRegistry.Asset memory gotN) = reg.lookupAssetByName("USDC");
@@ -207,7 +203,7 @@ contract AssetStoreTest is Test {
     /// @notice An asset may carry BOTH sources, and both are stored in their own named field.
     function test_addAssets_bothSources_storedInOwnFields() public {
         address navVault = _newToken("VLT");
-        _add(mkDualSourceAsset(tokenA, "BOTH", SRC, navVault, "USD"));
+        _add(mkDualSourceAsset(tokenA, "BOTH", SRC, navVault, USD_UNIT));
 
         (, IMarketRegistry.Asset memory got) = reg.lookupAssetByAddress(tokenA);
         assertEq(got.priceSource.addr, SRC, "price slot wrong");
@@ -229,12 +225,12 @@ contract AssetStoreTest is Test {
     ///      `setUp` added (1 hop, within the aggregator's budget of 1) and "USD" needs none.
     function test_addAssets_sourcesMayNameDifferentDenominations() public {
         address navVault = _newToken("MIXVLT");
-        _add(mkDualSourceAsset(tokenA, "MIXED", SRC, "ETH", navVault, "USD"));
+        _add(mkDualSourceAsset(tokenA, "MIXED", SRC, ETH_UNIT, navVault, USD_UNIT));
 
         (bool found, IMarketRegistry.Asset memory got) = reg.lookupAssetByAddress(tokenA);
         assertTrue(found, "an asset whose two sources disagree on the label must be accepted");
-        assertEq(got.priceSource.denomination, "ETH", "price source label not stored verbatim");
-        assertEq(got.navSource.denomination, "USD", "nav source label not stored verbatim");
+        assertEq(got.priceSource.denomination, ETH_UNIT, "price source label not stored verbatim");
+        assertEq(got.navSource.denomination, USD_UNIT, "nav source label not stored verbatim");
         assertEq(got.priceSource.addr, SRC, "price slot wrong");
         assertEq(got.navSource.addr, navVault, "nav slot wrong");
     }
@@ -281,9 +277,9 @@ contract AssetStoreTest is Test {
 
         // Both slots absent, both strings empty — an absent source is zeroed rather than copied.
         assertEq(got.priceSource.addr, address(0), "price slot should be absent");
-        assertEq(got.priceSource.denomination, "", "absent price slot should carry no denomination");
+        assertEq(got.priceSource.denomination, address(0), "absent price slot should carry no denomination");
         assertEq(got.navSource.addr, address(0), "nav slot should be absent");
-        assertEq(got.navSource.denomination, "", "absent nav slot should carry no denomination");
+        assertEq(got.navSource.denomination, address(0), "absent nav slot should carry no denomination");
 
         // Fully a member of the store: name index and enumeration both include it.
         (bool foundN, IMarketRegistry.Asset memory gotN) = reg.lookupAssetByName("SOURCELESS");
@@ -312,7 +308,7 @@ contract AssetStoreTest is Test {
     ///      of one, and only the PRESENT slots are validated.
     function test_addAssets_navSourceOnly_accepted() public {
         address navVault = _newToken("VLT");
-        _add(mkNavOnlyAsset(tokenA, "NAVONLY", navVault, "USD"));
+        _add(mkNavOnlyAsset(tokenA, "NAVONLY", navVault, USD_UNIT));
 
         (bool found, IMarketRegistry.Asset memory got) = reg.lookupAssetByAddress(tokenA);
         assertTrue(found, "NAV-only asset should be accepted");
@@ -329,7 +325,7 @@ contract AssetStoreTest is Test {
             tokenA,
             "WRONGFIELD",
             IMarketRegistry.AssetKind.ERC20,
-            mkNavSource(SRC, "USD"), // NAV-typed source sitting in the PRICE field
+            mkNavSource(SRC, USD_UNIT), // NAV-typed source sitting in the PRICE field
             noSource()
         );
         vm.prank(owner);
@@ -350,7 +346,7 @@ contract AssetStoreTest is Test {
             "WRONGFIELD2",
             IMarketRegistry.AssetKind.ERC20,
             noSource(),
-            mkPriceSource(SRC, "USD") // PRICE-typed source sitting in the NAV field
+            mkPriceSource(SRC, USD_UNIT) // PRICE-typed source sitting in the NAV field
         );
         vm.prank(owner);
         vm.expectRevert(
@@ -365,56 +361,44 @@ contract AssetStoreTest is Test {
 
     // ── addAsset: every PRESENT source's denomination must be a REGISTERED label ─
     //
-    // These cases are the write-time half of #75, and they are the reason a denomination is a governed
+    // These cases are the write-time half of checking a denomination at `addAsset` instead of at
+    // `deploy`, and they are the reason a denomination is a governed
     // fact rather than a free string. The predecessor accepted any label, then discovered the problem at
     // some later `deploy` in a different transaction — usually weeks later, usually to someone who had
-    // not made the mistake. The check now runs once per PRESENT source, against that source's own label.
+    // not made the mistake. The check now runs once per PRESENT source, against that source's own unit.
 
-    /// @notice A source `denomination` that was never registered → UnregisteredDenomination(label),
-    ///         naming the label byte-for-byte as supplied.
+    /// @notice A source `denomination` that was never registered → UnregisteredDenomination(unit),
+    ///         naming the unit as supplied.
     function test_addAssets_unregisteredSourceDenomination_reverts() public {
-        IMarketRegistry.Asset memory e = mkPriceOnlyAsset(tokenA, "UNREG", SRC, "MADEUP");
+        address madeUpUnit = makeAddr("madeUpUnit");
+        IMarketRegistry.Asset memory e = mkPriceOnlyAsset(tokenA, "UNREG", SRC, madeUpUnit);
 
         vm.prank(owner);
-        vm.expectRevert(abi.encodeWithSelector(IMarketRegistry.UnregisteredDenomination.selector, "MADEUP"));
+        vm.expectRevert(abi.encodeWithSelector(IMarketRegistry.UnregisteredDenomination.selector, madeUpUnit));
         reg.addAssets(one(e));
     }
 
-    /// @notice An EMPTY source `denomination` lands on the same error, naming the empty string.
-    /// @dev The empty string is simply not a registered label, so it needs no rule of its own — and it
+    /// @notice A ZERO source `denomination` lands on the same error, naming the zero address.
+    /// @dev The zero address is simply not a registered unit, so it needs no rule of its own — and it
     ///      is worth pinning that it needs none. The deleted `EmptyDenomination` error used to guard the
     ///      deleted asset-level field after a walk; this is a different question asked at a different
     ///      time, and it is the only one left.
-    function test_addAssets_emptySourceDenomination_reverts() public {
-        IMarketRegistry.Asset memory e = mkPriceOnlyAsset(tokenA, "EMPTYDENOM", SRC, "");
+    function test_addAssets_zeroSourceDenomination_reverts() public {
+        IMarketRegistry.Asset memory e = mkPriceOnlyAsset(tokenA, "EMPTYDENOM", SRC, address(0));
 
         vm.prank(owner);
-        vm.expectRevert(abi.encodeWithSelector(IMarketRegistry.UnregisteredDenomination.selector, ""));
+        vm.expectRevert(abi.encodeWithSelector(IMarketRegistry.UnregisteredDenomination.selector, address(0)));
         reg.addAssets(one(e));
     }
 
-    /// @notice Registration is EXACT BYTES and case-sensitive: the constructor seeds `"USD"`, so a
-    ///         lowercase `"usd"` is simply not a registered label and fails.
-    /// @dev The contrast with `lookupAssetByName` is deliberate and worth pinning side by side. A NAME is
-    ///      case-folded, because it is a human triage convenience and never a safety key. A DENOMINATION
-    ///      is not, because it selects which conversion feeds a source may bridge through — folding it
-    ///      would make `"usd"` and `"USD"` interchangeable safety keys on the strength of a typo.
-    function test_addAssets_lowercaseUsdSourceDenomination_reverts() public {
-        IMarketRegistry.Asset memory e = mkPriceOnlyAsset(tokenA, "LOWERUSD", SRC, "usd");
-
-        vm.prank(owner);
-        vm.expectRevert(abi.encodeWithSelector(IMarketRegistry.UnregisteredDenomination.selector, "usd"));
-        reg.addAssets(one(e));
-    }
-
-    /// @notice A registered label with no dollar path is refused —
-    ///         NoConversionPathToUsd(unit, budget). "GBP" is registered by `setUp` and has no edge.
+    /// @notice A registered unit with no dollar path is refused —
+    ///         NoConversionPathToUsd(unit, budget). `GBP_UNIT` is registered by `setUp` and has no edge.
     /// @dev Two separate questions, and the error tells them apart: `UnregisteredDenomination` means
-    ///      "nobody governs that label", `NoConversionPathToUsd` means "the label is fine, the graph
+    ///      "nobody governs that unit", `NoConversionPathToUsd` means "the unit is fine, the graph
     ///      cannot carry it to US Dollars". The budget in the error is 1 because the source is an
     ///      `AGGREGATOR_V3`, which spends `feed1` on itself and leaves only `feed2`.
     function test_addAssets_unreachableSourceDenomination_reverts() public {
-        IMarketRegistry.Asset memory e = mkPriceOnlyAsset(tokenA, "GBPQUOTED", SRC, "GBP");
+        IMarketRegistry.Asset memory e = mkPriceOnlyAsset(tokenA, "GBPQUOTED", SRC, GBP_UNIT);
 
         vm.prank(owner);
         vm.expectRevert(abi.encodeWithSelector(IMarketRegistry.NoConversionPathToUsd.selector, GBP_UNIT, uint256(1)));
@@ -422,13 +406,13 @@ contract AssetStoreTest is Test {
     }
 
     /// @notice The reachability check runs on the NAV slot too, with the vault's larger budget of 2.
-    /// @dev Both present sources are validated, each against its OWN hop budget. "GBP" has no edge at
+    /// @dev Both present sources are validated, each against its OWN hop budget. `GBP_UNIT` has no edge at
     ///      all, so two hops do not help it — which is what makes it a clean witness that the NAV slot
     ///      is checked rather than skipped, and that the budget reported is the vault's 2 and not the
     ///      aggregator's 1.
     function test_addAssets_unreachableNavDenomination_reverts() public {
         address navVault = _newToken("GBPVLT");
-        IMarketRegistry.Asset memory e = mkNavOnlyAsset(tokenA, "GBPNAV", navVault, "GBP");
+        IMarketRegistry.Asset memory e = mkNavOnlyAsset(tokenA, "GBPNAV", navVault, GBP_UNIT);
 
         vm.prank(owner);
         vm.expectRevert(abi.encodeWithSelector(IMarketRegistry.NoConversionPathToUsd.selector, GBP_UNIT, uint256(2)));
@@ -554,9 +538,9 @@ contract AssetStoreTest is Test {
         assertEq(got.addr, address(0), "addr not zeroed");
         assertEq(got.name, "", "name not zeroed");
         assertEq(got.priceSource.addr, address(0), "price source not zeroed");
-        assertEq(got.priceSource.denomination, "", "price source denomination not zeroed");
+        assertEq(got.priceSource.denomination, address(0), "price source denomination not zeroed");
         assertEq(got.navSource.addr, address(0), "nav source not zeroed");
-        assertEq(got.navSource.denomination, "", "nav source denomination not zeroed");
+        assertEq(got.navSource.denomination, address(0), "nav source denomination not zeroed");
 
         // Secondary name index cleared — proves read-name-before-delete ordering.
         (bool foundN,) = reg.lookupAssetByName("USDC");
@@ -625,11 +609,7 @@ contract AssetStoreTest is Test {
         address feedQuote = makeAddr("feedQuote");
         vm.prank(owner);
         reg.addConversionFeeds(
-            one(
-                IMarketRegistry.ConversionFeed({
-                    base: feedBase, quote: feedQuote, aggregatorAddress: makeAddr("agg"), feedDecimals: 8
-                })
-            )
+            one(IMarketRegistry.ConversionFeed({base: feedBase, quote: feedQuote, aggregatorAddress: makeAddr("agg")}))
         );
 
         vm.prank(owner);
@@ -715,8 +695,8 @@ contract AssetStoreTest is Test {
                 tokenA,
                 "UPD",
                 IMarketRegistry.AssetKind.ERC4626,
-                mkPriceSource(SRC, "USD"),
-                mkNavSource(navVault, "USD")
+                mkPriceSource(SRC, USD_UNIT),
+                mkNavSource(navVault, USD_UNIT)
             )
         );
 
@@ -727,16 +707,16 @@ contract AssetStoreTest is Test {
                 tokenA,
                 "UPD",
                 IMarketRegistry.AssetKind.ERC4626,
-                mkPriceSource(newAgg, "ETH"),
-                mkNavSource(navVault, "USD")
+                mkPriceSource(newAgg, ETH_UNIT),
+                mkNavSource(navVault, USD_UNIT)
             )
         );
 
         (, IMarketRegistry.Asset memory got) = reg.lookupAssetByAddress(tokenA);
         assertEq(got.priceSource.addr, newAgg, "price source not replaced");
-        assertEq(got.priceSource.denomination, "ETH", "price source denomination not replaced");
+        assertEq(got.priceSource.denomination, ETH_UNIT, "price source denomination not replaced");
         assertEq(got.navSource.addr, navVault, "nav source not carried across");
-        assertEq(got.navSource.denomination, "USD", "nav denomination not carried across");
+        assertEq(got.navSource.denomination, USD_UNIT, "nav denomination not carried across");
     }
 
     /// @notice An edit that only adds a NAV source keeps the price source, because the replacement
@@ -745,7 +725,7 @@ contract AssetStoreTest is Test {
         _add(_asset(tokenA, "UPD2"));
 
         address newVault = _newToken("NV2");
-        _reAdd(tokenA, mkDualSourceAsset(tokenA, "UPD2", SRC, "USD", newVault, "USD"));
+        _reAdd(tokenA, mkDualSourceAsset(tokenA, "UPD2", SRC, USD_UNIT, newVault, USD_UNIT));
 
         (, IMarketRegistry.Asset memory got) = reg.lookupAssetByAddress(tokenA);
         assertEq(got.navSource.addr, newVault, "nav source not written");
@@ -764,18 +744,19 @@ contract AssetStoreTest is Test {
         vm.startPrank(owner);
         reg.removeAssets(one(tokenA));
         vm.expectRevert(abi.encodeWithSelector(IMarketRegistry.NoConversionPathToUsd.selector, GBP_UNIT, uint256(1)));
-        reg.addAssets(one(mkPriceOnlyAsset(tokenA, "UPD3", SRC, "GBP")));
+        reg.addAssets(one(mkPriceOnlyAsset(tokenA, "UPD3", SRC, GBP_UNIT)));
         vm.stopPrank();
     }
 
-    /// @notice An UNREGISTERED label is refused too, naming the label.
-    function test_reAdd_unregisteredLabel_reverts() public {
+    /// @notice An UNREGISTERED unit is refused too, naming the unit.
+    function test_reAdd_unregisteredUnit_reverts() public {
         _add(_asset(tokenA, "UPD4"));
+        address madeUpUnit = makeAddr("madeUpUnit");
 
         vm.startPrank(owner);
         reg.removeAssets(one(tokenA));
-        vm.expectRevert(abi.encodeWithSelector(IMarketRegistry.UnregisteredDenomination.selector, "MADEUP"));
-        reg.addAssets(one(mkPriceOnlyAsset(tokenA, "UPD4", SRC, "MADEUP")));
+        vm.expectRevert(abi.encodeWithSelector(IMarketRegistry.UnregisteredDenomination.selector, madeUpUnit));
+        reg.addAssets(one(mkPriceOnlyAsset(tokenA, "UPD4", SRC, madeUpUnit)));
         vm.stopPrank();
     }
 
@@ -788,16 +769,16 @@ contract AssetStoreTest is Test {
                 tokenA,
                 "UPD5",
                 IMarketRegistry.AssetKind.ERC4626,
-                mkPriceSource(SRC, "USD"),
-                mkNavSource(navVault, "USD")
+                mkPriceSource(SRC, USD_UNIT),
+                mkNavSource(navVault, USD_UNIT)
             )
         );
 
-        _reAdd(tokenA, mkPriceOnlyAsset(tokenA, "UPD5", SRC, "USD"));
+        _reAdd(tokenA, mkPriceOnlyAsset(tokenA, "UPD5", SRC, USD_UNIT));
 
         (, IMarketRegistry.Asset memory got) = reg.lookupAssetByAddress(tokenA);
         assertEq(got.navSource.addr, address(0), "nav slot not cleared");
-        assertEq(got.navSource.denomination, "", "cleared slot must not keep its denomination");
+        assertEq(got.navSource.denomination, address(0), "cleared slot must not keep its denomination");
         assertEq(got.priceSource.addr, SRC, "price source must survive the drop");
     }
 
@@ -815,7 +796,7 @@ contract AssetStoreTest is Test {
         (bool found, IMarketRegistry.Asset memory got) = reg.lookupAssetByAddress(tokenA);
         assertTrue(found, "the asset must survive losing its last source");
         assertEq(got.priceSource.addr, address(0), "price slot not cleared");
-        assertEq(got.priceSource.denomination, "", "cleared slot must not keep its denomination");
+        assertEq(got.priceSource.denomination, address(0), "cleared slot must not keep its denomination");
         assertEq(got.navSource.addr, address(0), "nav slot should still be absent");
 
         // Still enumerable and still reachable by name — the record exists, it is just empty.
@@ -826,7 +807,7 @@ contract AssetStoreTest is Test {
 
         // And a source can be put straight back on with another edit.
         _reAdd(tokenA, _asset(tokenA, "UPD6"));
-        assertEq(_sourceDenomination(tokenA, IMarketRegistry.SourceType.PRICE), "USD", "source not restorable");
+        assertEq(_sourceDenomination(tokenA, IMarketRegistry.SourceType.PRICE), USD_UNIT, "source not restorable");
     }
 
     /// @notice ORDER MATTERS inside the bundle. Add-then-remove reverts on the add, so a
@@ -837,7 +818,7 @@ contract AssetStoreTest is Test {
 
         vm.prank(owner);
         vm.expectRevert(IMarketRegistry.EntryAlreadyExists.selector);
-        reg.addAssets(one(mkPriceOnlyAsset(tokenA, "UPD7", makeAddr("other"), "USD")));
+        reg.addAssets(one(mkPriceOnlyAsset(tokenA, "UPD7", makeAddr("other"), USD_UNIT)));
     }
 
     /// @notice Between the remove and the add the asset is genuinely absent — which is exactly why the
@@ -904,12 +885,11 @@ contract AssetStoreTest is Test {
 
     // ── calldata surgery helpers (enum panic tests) ────────────────────────────
     //
-    // `Asset`'s ABI head is FIVE words, because `name` and BOTH `AssetSource` members are dynamic (each
-    // source contains a string), so each contributes an OFFSET word. The asset-level `denomination` used
-    // to sit between `kind` and `priceSource` and contributed a sixth; deleting it moved the two source
-    // offsets down one word each and left `kind` exactly where it was:
+    // `Asset`'s ABI head is ELEVEN words. Only `name` is dynamic; each `AssetSource` is a static
+    // four-word tuple (its `denomination` is an address now, not a string), so both sources are laid
+    // out INLINE in the head rather than behind an offset word:
     //
-    //     addr:0 · name-offset:32 · kind:64 · priceSource-offset:96 · navSource-offset:128
+    //     addr:0 · name-offset:32 · kind:64 · priceSource:96..224 · navSource:224..352
     //
     // The argument is now an ARRAY of assets, so the tuple no longer sits at a fixed byte. Walking in
     // from the selector: byte 4 holds the offset to the array data; the array's length word sits at
@@ -922,10 +902,9 @@ contract AssetStoreTest is Test {
     // the single-asset `addAsset` became the array-taking `addAssets` and a stale constant here does
     // not fail loudly — it lands on a different word and an out-of-range enum then PASSES the check.
     //
-    // From the tuple head onward everything is as it was: an offset inside a tuple is relative to the
-    // start of that tuple's encoding, so a source head sits at `tupleHead + word(tupleHead +
-    // <offsetWord>)`, and each source head is four words: addr:0 · sourceType:32 · sourceInterface:64 ·
-    // denomination-offset:96.
+    // From the tuple head onward the source heads sit at FIXED offsets — `tupleHead + 96` and
+    // `tupleHead + 224` — with no indirection, and each source head is four words: addr:0 ·
+    // sourceType:32 · sourceInterface:64 · denomination:96.
 
     function _tupleHead(bytes memory cd) internal pure returns (uint256) {
         uint256 region = 4 + _readWord(cd, 4) + 32;
@@ -941,13 +920,11 @@ contract AssetStoreTest is Test {
     }
 
     function _priceSourceHeadOffset(bytes memory cd) internal pure returns (uint256) {
-        uint256 head = _tupleHead(cd);
-        return head + _readWord(cd, head + 96);
+        return _tupleHead(cd) + 96; // inline static tuple: no offset word to read
     }
 
     function _navSourceHeadOffset(bytes memory cd) internal pure returns (uint256) {
-        uint256 head = _tupleHead(cd);
-        return head + _readWord(cd, head + 128);
+        return _tupleHead(cd) + 224;
     }
 
     function _readWord(bytes memory cd, uint256 byteOffset) internal pure returns (uint256 w) {

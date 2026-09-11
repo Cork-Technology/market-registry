@@ -49,10 +49,10 @@ import {one} from "./helpers/ArrayHelpers.sol";
 ///      by hand, and the first divergence would be a silently wrong test.
 contract WalkHarness is MarketRegistry {
     /// @notice Run the underlying-asset walk for `e` and return what it derived.
-    /// @dev The empty string is UNRESOLVED and is a real answer, not an error — the walk has no revert of
+    /// @dev The zero address is UNRESOLVED and is a real answer, not an error — the walk has no revert of
     ///      its own any more. `view`, so solc reaches it with a `STATICCALL`, which is what keeps the
     ///      reentrant-probe test meaningful.
-    function derive(IMarketRegistry.Asset calldata e) external view returns (string memory) {
+    function derive(IMarketRegistry.Asset calldata e) external view returns (address) {
         return MarketRegistryLib.deriveDenomination(_assetIndex, _assets, e);
     }
 }
@@ -71,7 +71,7 @@ contract WalkHarness is MarketRegistry {
 ///
 /// @dev Covers every walk terminal (depth cap, cycle / self-loop, the registered-denominated terminal,
 ///      the leaf source-denomination rule, the unregistered mid-chain leaf, the sourceless entry) and
-///      the hostile-shape probe matrix for #82.
+///      the hostile-shape probe matrix.
 ///
 ///      ## What the successor shape changed here, in four points
 ///
@@ -125,9 +125,9 @@ contract WalkTest is WalkTestBase {
     function test_walk_leafAgreeingSources_derives() public {
         address a = address(new RevertingAsset()); // probe reverts → leaf; cur == e.addr
         IMarketRegistry.Asset memory e =
-            _asset2(a, "AGREE", mkPriceSource(makeAddr("srcA"), "USD"), mkNavSource(makeAddr("srcB"), "USD"));
+            _asset2(a, "AGREE", mkPriceSource(makeAddr("srcA"), USD_UNIT), mkNavSource(makeAddr("srcB"), USD_UNIT));
 
-        assertEq(_derive(e), "USD");
+        assertEq(_derive(e), USD_UNIT);
     }
 
     /// @notice Two present sources whose denominations DISAGREE ("USD" on the price source, "ETH" on the
@@ -136,37 +136,38 @@ contract WalkTest is WalkTestBase {
     /// @dev Both halves matter and they used to be one contradiction. The registry validates each
     ///      present source's label SEPARATELY and never compares the two, because the two legs of a
     ///      Morpho oracle resolve their conversion paths independently — so disagreement is legal. What
-    ///      disagreement costs is the walk: there is no single label that speaks for the whole asset, so
-    ///      `leafQuote` returns the empty string.
+    ///      disagreement costs is the walk: there is no single unit that speaks for the whole asset, so
+    ///      `leafQuote` returns the zero address.
     ///
     ///      Migrated from "the caller residual stands". There is no residual to stand any more, so the
-    ///      assertion is the empty string, which is UNRESOLVED and not an error.
+    ///      assertion is the zero address, which is UNRESOLVED and not an error.
     function test_walk_leafDisagreeingSources_unresolvedButAccepted() public {
         address a = address(new RevertingAsset());
         IMarketRegistry.Asset memory e =
-            _asset2(a, "DISAGREE", mkPriceSource(makeAddr("srcA"), "USD"), mkNavSource(makeAddr("srcB"), "ETH"));
+            _asset2(a, "DISAGREE", mkPriceSource(makeAddr("srcA"), USD_UNIT), mkNavSource(makeAddr("srcB"), ETH_UNIT));
 
-        assertEq(_derive(e), "", "disagreeing sources give the walk no single label");
+        assertEq(_derive(e), address(0), "disagreeing sources give the walk no single unit");
 
         iReg.addAssets(one(e));
-        assertEq(_storedDenomination(a, IMarketRegistry.SourceType.PRICE), "USD");
-        assertEq(_storedDenomination(a, IMarketRegistry.SourceType.NAV), "ETH", "both labels are stored as stated");
+        assertEq(_storedDenomination(a, IMarketRegistry.SourceType.PRICE), USD_UNIT);
+        assertEq(_storedDenomination(a, IMarketRegistry.SourceType.NAV), ETH_UNIT, "both units are stored as stated");
     }
 
-    /// @notice An EMPTY `denomination` on a PRESENT source is refused at write time, naming the empty
-    ///         label — it never reaches the walk.
-    /// @dev The empty string is not a registered denomination, so `_validateSourcePath` rejects the
+    /// @notice A ZERO `denomination` on a PRESENT source is refused at write time, naming the zero
+    ///         address — it never reaches the walk.
+    /// @dev The zero address is not a registered denomination, so `_validateSourcePath` rejects the
     ///      source before anything else runs. This is what the deleted `EmptyDenomination` guard is NOT:
     ///      that one fired once, after a walk, about a field that no longer exists; this one fires per
-    ///      present source, at write time, about the label that source states. Different question, and
-    ///      the answer here is strictly stronger — a typo'd label fails loudly instead of quietly
+    ///      present source, at write time, about the unit that source states. Different question, and
+    ///      the answer here is strictly stronger — a missing unit fails loudly instead of quietly
     ///      falling back to something the caller supplied.
-    function test_walk_leafEmptyDenomination_rejectedAtWriteTime() public {
+    function test_walk_leafZeroDenomination_rejectedAtWriteTime() public {
         address a = address(new RevertingAsset());
-        IMarketRegistry.Asset memory e =
-            _asset2(a, "EMPTYQUOTE", mkPriceSource(makeAddr("srcA"), "USD"), mkNavSource(makeAddr("srcB"), ""));
+        IMarketRegistry.Asset memory e = _asset2(
+            a, "EMPTYQUOTE", mkPriceSource(makeAddr("srcA"), USD_UNIT), mkNavSource(makeAddr("srcB"), address(0))
+        );
 
-        vm.expectRevert(abi.encodeWithSelector(IMarketRegistry.UnregisteredDenomination.selector, ""));
+        vm.expectRevert(abi.encodeWithSelector(IMarketRegistry.UnregisteredDenomination.selector, address(0)));
         iReg.addAssets(one(e));
     }
 
@@ -176,8 +177,8 @@ contract WalkTest is WalkTestBase {
         address a = address(new RevertingAsset()); // e.addr leaf
         address sourceThatRevertsIfCalled = address(new RevertingAsset());
 
-        // Had the walk called the source, this would have bubbled instead of returning a string.
-        assertEq(_derive(_asset1(a, "ACRDX", mkPriceSource(sourceThatRevertsIfCalled, "USD"))), "USD");
+        // Had the walk called the source, this would have bubbled instead of returning a unit.
+        assertEq(_derive(_asset1(a, "ACRDX", mkPriceSource(sourceThatRevertsIfCalled, USD_UNIT))), USD_UNIT);
     }
 
     /// @notice An asset with NEITHER source is UNRESOLVED, and both the walk and `addAsset` accept it
@@ -185,7 +186,7 @@ contract WalkTest is WalkTestBase {
     /// @dev This is the state the deleted `EmptySources` error used to forbid. It is now a legal entry:
     ///      with no source present there is no denomination anywhere on it, so there is nothing for the
     ///      leaf rule to read and nothing that has to reach US Dollars. The walk says so by returning
-    ///      the empty string, which is why `""` had to stop meaning "error" — see the deleted
+    ///      the zero address, which is why zero had to stop meaning "error" — see the deleted
     ///      `EmptyDenomination` note in the file header.
     ///
     ///      The address must be a real CONTRACT even though nothing about the asset is source-shaped:
@@ -195,7 +196,7 @@ contract WalkTest is WalkTestBase {
         address a = address(new RevertingAsset());
         IMarketRegistry.Asset memory e = mkSourcelessAsset(a, "SOURCELESS");
 
-        assertEq(_derive(e), "", "no source means no label for the leaf rule to read");
+        assertEq(_derive(e), address(0), "no source means no unit for the leaf rule to read");
 
         iReg.addAssets(one(e));
         (bool found, IMarketRegistry.Asset memory got) = iReg.lookupAssetByAddress(a);
@@ -213,44 +214,44 @@ contract WalkTest is WalkTestBase {
     ///      is seeded with a plain `addAsset` and the walk finds it.
     function test_walk_hopToRegisteredTerminator_derives() public {
         address term = address(new RevertingAsset());
-        iReg.addAssets(one(_asset1(term, "TERM", mkPriceSource(term, "USD"))));
+        iReg.addAssets(one(_asset1(term, "TERM", mkPriceSource(term, USD_UNIT))));
 
         address vault = address(new MockVaultAsset(term));
-        IMarketRegistry.Asset memory e = _asset2(vault, "VAULT", noSource(), mkNavSource(vault, "USD"));
+        IMarketRegistry.Asset memory e = _asset2(vault, "VAULT", noSource(), mkNavSource(vault, USD_UNIT));
 
-        assertEq(_derive(e), "USD", "the hop must inherit the terminator's denomination");
+        assertEq(_derive(e), USD_UNIT, "the hop must inherit the terminator's denomination");
     }
 
     /// @notice A derived terminal BEATS the head's own source label: the vault below states "USD" on its
-    ///         source but hops onto a terminator denominated "ETH", and "ETH" is what the walk returns.
+    ///         source but hops onto a terminator denominated in Ether, and Ether is what the walk returns.
     /// @dev The leaf rule is only consulted when the head does not hop. Ordering the two the other way
-    ///      round would let a label somebody typed outrank a live chain read — which would defeat the
+    ///      round would let a unit somebody typed outrank a live chain read — which would defeat the
     ///      entire reason this function was kept.
     function test_walk_hopTerminalBeatsLeafQuote() public {
         address term = address(new RevertingAsset());
-        iReg.addAssets(one(_asset1(term, "ETHTERM2", mkPriceSource(term, "ETH"))));
+        iReg.addAssets(one(_asset1(term, "ETHTERM2", mkPriceSource(term, ETH_UNIT))));
 
         address vault = address(new MockVaultAsset(term));
-        IMarketRegistry.Asset memory e = _asset2(vault, "HEADTERM", noSource(), mkNavSource(vault, "USD"));
+        IMarketRegistry.Asset memory e = _asset2(vault, "HEADTERM", noSource(), mkNavSource(vault, USD_UNIT));
 
-        assertEq(_derive(e), "ETH", "the hop terminal must outrank the leaf label");
+        assertEq(_derive(e), ETH_UNIT, "the hop terminal must outrank the leaf unit");
     }
 
     /// @notice A mid-chain leaf that is NOT a stored asset is UNRESOLVED — the walk hops once, finds
-    ///         nothing registered, and returns the empty string.
-    /// @dev BS-WLK-07, and the case that used to be `test_walk_unresolvableWithEmptyCaller_reverts`
+    ///         nothing registered, and returns the zero address.
+    /// @dev This is the case that used to be `test_walk_unresolvableWithEmptyCaller_reverts`
     ///      asserting `EmptyDenomination`. Nothing reverts now: the walk returns UNRESOLVED and
-    ///      `addAsset` stores the entry regardless, because the NAV source's own label is registered and
+    ///      `addAsset` stores the entry regardless, because the NAV source's own unit is registered and
     ///      reachable and that is the only question the write path asks.
     function test_walk_unregisteredMidChainLeaf_unresolvedButAccepted() public {
         address underlying = address(new MockERC20("Nobody", "NOBODY", 18));
         address vault = address(new MockVaultAsset(underlying));
-        IMarketRegistry.Asset memory e = _asset2(vault, "UNRESEMPTY", noSource(), mkNavSource(vault, "USD"));
+        IMarketRegistry.Asset memory e = _asset2(vault, "UNRESEMPTY", noSource(), mkNavSource(vault, USD_UNIT));
 
-        assertEq(_derive(e), "", "an unregistered mid-chain leaf resolves to nothing");
+        assertEq(_derive(e), address(0), "an unregistered mid-chain leaf resolves to nothing");
 
         iReg.addAssets(one(e));
-        assertEq(_storedDenomination(vault, IMarketRegistry.SourceType.NAV), "USD", "the stated label is stored");
+        assertEq(_storedDenomination(vault, IMarketRegistry.SourceType.NAV), USD_UNIT, "the stated unit is stored");
     }
 
     // ── cycle / self-loop ─────────────────────────────────────────────────────────
@@ -262,9 +263,9 @@ contract WalkTest is WalkTestBase {
         a.setNext(address(b));
         b.setNext(address(a)); // B unstored → the hop back to A trips cycle detection
 
-        IMarketRegistry.Asset memory e = _asset2(address(a), "CYCLE", noSource(), mkNavSource(address(a), "USD"));
+        IMarketRegistry.Asset memory e = _asset2(address(a), "CYCLE", noSource(), mkNavSource(address(a), USD_UNIT));
 
-        assertEq(_derive(e), "");
+        assertEq(_derive(e), address(0));
     }
 
     // ── depth limit ───────────────────────────────────────────────────────────────
@@ -274,28 +275,28 @@ contract WalkTest is WalkTestBase {
     function test_walk_depthLimitExceeded_unresolved() public {
         // Stored terminators both chains eventually point at.
         address deepTerminator = address(new RevertingAsset());
-        iReg.addAssets(one(_asset1(deepTerminator, "DEEPTERM", mkPriceSource(deepTerminator, "USD"))));
+        iReg.addAssets(one(_asset1(deepTerminator, "DEEPTERM", mkPriceSource(deepTerminator, USD_UNIT))));
         address ctrlTerminator = address(new RevertingAsset());
-        iReg.addAssets(one(_asset1(ctrlTerminator, "CTRLTERM", mkPriceSource(ctrlTerminator, "USD"))));
+        iReg.addAssets(one(_asset1(ctrlTerminator, "CTRLTERM", mkPriceSource(ctrlTerminator, USD_UNIT))));
 
         // 12-hop chain: head → 11 intermediates → deepTerminator. Bails past depth 10.
         address deepHead = _buildChain(deepTerminator, 12);
-        IMarketRegistry.Asset memory deep = _asset2(deepHead, "DEEPHEAD", noSource(), mkNavSource(deepHead, "USD"));
-        assertEq(_derive(deep), "", "12-deep must exceed the cap and resolve to nothing");
+        IMarketRegistry.Asset memory deep = _asset2(deepHead, "DEEPHEAD", noSource(), mkNavSource(deepHead, USD_UNIT));
+        assertEq(_derive(deep), address(0), "12-deep must exceed the cap and resolve to nothing");
 
         // 3-hop control chain reaches its terminator well inside the cap.
         address ctrlHead = _buildChain(ctrlTerminator, 3);
-        IMarketRegistry.Asset memory ctrl = _asset2(ctrlHead, "CTRLHEAD", noSource(), mkNavSource(ctrlHead, "USD"));
-        assertEq(_derive(ctrl), "USD", "3-deep control must resolve");
+        IMarketRegistry.Asset memory ctrl = _asset2(ctrlHead, "CTRLHEAD", noSource(), mkNavSource(ctrlHead, USD_UNIT));
+        assertEq(_derive(ctrl), USD_UNIT, "3-deep control must resolve");
     }
 
-    // ── #82 hostile-probe matrix: shapes the probe CATCHES → leaf ──────────────────
+    // ── hostile-probe matrix: shapes the probe CATCHES → leaf ──────────────────────
 
     /// @notice `asset()` reverting is caught: the node degrades to a leaf and the leaf rule answers.
     function test_probe_assetReverts_degradesToLeaf() public {
         address a = address(new RevertingAsset());
 
-        assertEq(_derive(_asset1(a, "PROBEREVERT", mkPriceSource(a, "USD"))), "USD");
+        assertEq(_derive(_asset1(a, "PROBEREVERT", mkPriceSource(a, USD_UNIT))), USD_UNIT);
     }
 
     /// @notice A target with NO `asset()` at all — a plain token — is caught the same way.
@@ -305,14 +306,14 @@ contract WalkTest is WalkTestBase {
     function test_probe_noAssetFunction_degradesToLeaf() public {
         address a = address(new MockERC20("Plain", "PLAIN", 6));
 
-        assertEq(_derive(_asset1(a, "PLAINTOKEN", mkPriceSource(a, "USD"))), "USD");
+        assertEq(_derive(_asset1(a, "PLAINTOKEN", mkPriceSource(a, USD_UNIT))), USD_UNIT);
     }
 
     /// @notice A clean ZERO-address return is refused as a hop (never a hop to `address(0)`) → leaf.
     function test_probe_zeroAddressReturn_degradesToLeaf() public {
         address a = address(new ZeroAddressAsset());
 
-        assertEq(_derive(_asset1(a, "ZEROADDR", mkPriceSource(a, "USD"))), "USD");
+        assertEq(_derive(_asset1(a, "ZEROADDR", mkPriceSource(a, USD_UNIT))), USD_UNIT);
     }
 
     /// @notice A SELF-REFERENCE is caught by the cycle log, not by a special case: the head is recorded
@@ -322,9 +323,9 @@ contract WalkTest is WalkTestBase {
     ///      until the gas ran out, so a clean UNRESOLVED is the observable difference.
     function test_probe_selfReference_hitsCycleGuard() public {
         address a = address(new SelfLoopAsset());
-        IMarketRegistry.Asset memory e = _asset2(a, "SELFREF", noSource(), mkNavSource(a, "USD"));
+        IMarketRegistry.Asset memory e = _asset2(a, "SELFREF", noSource(), mkNavSource(a, USD_UNIT));
 
-        assertEq(_derive(e), "");
+        assertEq(_derive(e), address(0));
     }
 
     /// @notice A three-node cycle (A→B→C→A) terminates too — the guard scans every prior node, not just
@@ -337,9 +338,9 @@ contract WalkTest is WalkTestBase {
         b.setNext(address(c));
         c.setNext(address(a));
 
-        IMarketRegistry.Asset memory e = _asset2(address(a), "CYCLE3", noSource(), mkNavSource(address(a), "USD"));
+        IMarketRegistry.Asset memory e = _asset2(address(a), "CYCLE3", noSource(), mkNavSource(address(a), USD_UNIT));
 
-        assertEq(_derive(e), "");
+        assertEq(_derive(e), address(0));
     }
 
     /// @notice A 100-kilobyte return whose FIRST word is a clean address is accepted and hopped: the
@@ -350,25 +351,25 @@ contract WalkTest is WalkTestBase {
     ///      failure.
     function test_probe_returnBomb_hopsAndDoesNotBrick() public {
         address term = address(new RevertingAsset());
-        iReg.addAssets(one(_asset1(term, "BOMBTERM", mkPriceSource(term, "ETH"))));
+        iReg.addAssets(one(_asset1(term, "BOMBTERM", mkPriceSource(term, ETH_UNIT))));
 
         address bomb = address(new ReturnBombAsset(term, 100_000));
-        IMarketRegistry.Asset memory e = _asset2(bomb, "BOMB", noSource(), mkNavSource(bomb, "USD"));
+        IMarketRegistry.Asset memory e = _asset2(bomb, "BOMB", noSource(), mkNavSource(bomb, USD_UNIT));
 
-        assertEq(_derive(e), "ETH", "a bomb with a clean first word must still hop");
+        assertEq(_derive(e), ETH_UNIT, "a bomb with a clean first word must still hop");
     }
 
     /// @notice A well-formed LIE (clean, non-zero, but the wrong underlying) is undetectable on-chain:
     ///         the probe accepts it and hops. Detection is admission-gated.
     function test_probe_wellFormedLiar_hopsAccepted() public {
         address ethTerminator = address(new RevertingAsset());
-        iReg.addAssets(one(_asset1(ethTerminator, "ETHTERM", mkPriceSource(ethTerminator, "ETH"))));
+        iReg.addAssets(one(_asset1(ethTerminator, "ETHTERM", mkPriceSource(ethTerminator, ETH_UNIT))));
 
         address liar = address(new WellFormedLiarAsset(ethTerminator));
-        IMarketRegistry.Asset memory e = _asset2(liar, "LIAR", noSource(), mkNavSource(liar, "USD"));
+        IMarketRegistry.Asset memory e = _asset2(liar, "LIAR", noSource(), mkNavSource(liar, USD_UNIT));
 
         // The undetectable lie is followed, so the walk speaks for the node the liar named.
-        assertEq(_derive(e), "ETH");
+        assertEq(_derive(e), ETH_UNIT);
     }
 
     /// @notice A reentrant probe attempting a state write during the probe cannot write: the victim
@@ -385,9 +386,9 @@ contract WalkTest is WalkTestBase {
         bytes memory payload = abi.encodeWithSelector(WriteVictim.poke.selector);
         address a = address(new ReentrantProbeAsset(address(victim), payload));
 
-        IMarketRegistry.Asset memory e = _asset2(a, "REENTRANT", noSource(), mkNavSource(a, "USD"));
+        IMarketRegistry.Asset memory e = _asset2(a, "REENTRANT", noSource(), mkNavSource(a, USD_UNIT));
 
-        assertEq(_derive(e), "USD", "a caught probe must fall through to the leaf rule");
+        assertEq(_derive(e), USD_UNIT, "a caught probe must fall through to the leaf rule");
         assertEq(victim.counter(), 0, "the probe must not be able to write");
     }
 
@@ -414,14 +415,14 @@ contract WalkTest is WalkTestBase {
         address burner = address(new GasBurningAsset());
         address honest = address(new RevertingAsset());
 
-        uint256 burnerCost = _deriveGasCost(_asset2(burner, "GASBURN", noSource(), mkNavSource(burner, "USD")));
-        uint256 honestCost = _deriveGasCost(_asset2(honest, "HONEST", noSource(), mkNavSource(honest, "USD")));
+        uint256 burnerCost = _deriveGasCost(_asset2(burner, "GASBURN", noSource(), mkNavSource(burner, USD_UNIT)));
+        uint256 honestCost = _deriveGasCost(_asset2(honest, "HONEST", noSource(), mkNavSource(honest, USD_UNIT)));
 
         assertLt(honestCost, 100_000, "an honest leaf walk is cheap");
         assertGt(burnerCost, 7_000_000, "an uncapped probe against a gas burner consumes the whole budget");
     }
 
-    // ── #82 hostile-probe matrix: MALFORMED returns that bubble ────────────────────
+    // ── hostile-probe matrix: MALFORMED returns that bubble ────────────────────────
     //
     // These are the deliberate reversal recorded on `probeAsset`: a target either implements `asset()`
     // returning a proper address, or does not implement it at all. A target that RETURNS MALFORMED DATA
@@ -437,7 +438,7 @@ contract WalkTest is WalkTestBase {
     /// @notice A short (<32-byte) `asset()` return bubbles out of the walk with empty revert data.
     function test_probe_shortReturn_bubblesUncatchably() public {
         address a = address(new ShortReturnAsset());
-        IMarketRegistry.Asset memory e = _asset2(a, "SHORTRET", noSource(), mkNavSource(a, "USD"));
+        IMarketRegistry.Asset memory e = _asset2(a, "SHORTRET", noSource(), mkNavSource(a, USD_UNIT));
 
         (bool ok, bytes memory ret) = _tryDerive(e);
         assertFalse(ok, "a short probe return must not be reclassified as a leaf");
@@ -456,7 +457,7 @@ contract WalkTest is WalkTestBase {
     function test_probe_emptyReturn_bubblesUncatchably() public {
         address a = address(new EmptyReturnAsset());
 
-        (bool ok, bytes memory ret) = _tryDerive(_asset2(a, "EMPTYRET", noSource(), mkNavSource(a, "USD")));
+        (bool ok, bytes memory ret) = _tryDerive(_asset2(a, "EMPTYRET", noSource(), mkNavSource(a, USD_UNIT)));
         assertFalse(ok, "an empty probe return must not be reclassified as a leaf");
         assertEq(ret.length, 0, "the ABI-decode revert carries no error data");
     }
@@ -467,7 +468,7 @@ contract WalkTest is WalkTestBase {
     function test_probe_dirtyBits_bubblesUncatchably() public {
         address a = address(new DirtyBitsAsset());
 
-        (bool ok, bytes memory ret) = _tryDerive(_asset2(a, "DIRTYBITS", noSource(), mkNavSource(a, "USD")));
+        (bool ok, bytes memory ret) = _tryDerive(_asset2(a, "DIRTYBITS", noSource(), mkNavSource(a, USD_UNIT)));
         assertFalse(ok, "a dirty address word must not be masked into a hop");
         assertEq(ret.length, 0, "the ABI-decode revert carries no error data");
     }
@@ -478,24 +479,25 @@ contract WalkTest is WalkTestBase {
         address bad = address(new ShortReturnAsset());
         address head = address(new MockVaultAsset(bad));
 
-        (bool ok, bytes memory ret) = _tryDerive(_asset2(head, "MIDCHAINBAD", noSource(), mkNavSource(head, "USD")));
+        (bool ok, bytes memory ret) = _tryDerive(_asset2(head, "MIDCHAINBAD", noSource(), mkNavSource(head, USD_UNIT)));
         assertFalse(ok, "a malformed node mid-chain must bubble");
         assertEq(ret.length, 0, "the ABI-decode revert carries no error data");
     }
 
-    // ── the write-time label check (what replaced the post-walk guard) ─────────────
+    // ── the write-time unit check (what replaced the post-walk guard) ──────────────
 
-    /// @notice A source's `denomination` must be a REGISTERED label, so an unregistered value can never
+    /// @notice A source's `denomination` must be a REGISTERED unit, so an unregistered value can never
     ///         enter the store in the first place.
     /// @dev The write path's whole denomination rule, and the reason the walk needs no guard of its own.
     ///      It used to matter that a DERIVED value be registered too, because the derived value got
-    ///      pinned onto the asset; nothing is pinned now, so the only question left is about the label a
+    ///      pinned onto the asset; nothing is pinned now, so the only question left is about the unit a
     ///      source states.
     function test_walk_sourceDenominationMustBeRegistered() public {
         address a = address(new RevertingAsset());
-        IMarketRegistry.Asset memory e = _asset1(a, "UNREGQUOTE", mkPriceSource(a, "MADEUP"));
+        address madeUpUnit = makeAddr("madeUpUnit");
+        IMarketRegistry.Asset memory e = _asset1(a, "UNREGQUOTE", mkPriceSource(a, madeUpUnit));
 
-        vm.expectRevert(abi.encodeWithSelector(IMarketRegistry.UnregisteredDenomination.selector, "MADEUP"));
+        vm.expectRevert(abi.encodeWithSelector(IMarketRegistry.UnregisteredDenomination.selector, madeUpUnit));
         iReg.addAssets(one(e));
     }
 
@@ -504,14 +506,14 @@ contract WalkTest is WalkTestBase {
     /// @notice The whole deterministic replica seeds in dependency order and every entry stores the
     ///         denomination the fixture predicts.
     /// @dev `expected[i]` used to mean "what the walk will derive and pin". With no walk on the write
-    ///      path it means "the label this entry's one present source states, which `addAsset` must store
+    ///      path it means "the unit this entry's one present source states, which `addAsset` must store
     ///      verbatim". The values are unchanged; the claim is now about faithful storage.
     ///
     ///      Which of the two slots to read follows the entry itself rather than a hard-coded band table,
     ///      so the assertion survives the topology being extended.
     function test_walk_tenAssetSet_storesExpected() public {
         TenAssetSet fixtureSet = new TenAssetSet();
-        (IMarketRegistry.Asset[] memory entries, string[] memory expected) = fixtureSet.build();
+        (IMarketRegistry.Asset[] memory entries, address[] memory expected) = fixtureSet.build();
 
         iReg.addAssets(entries);
 
@@ -530,7 +532,7 @@ contract WalkTest is WalkTestBase {
 
     /// @dev The walk's return value for `e`. This — not `_storedDenomination` — is what a walk assertion
     ///      has to read now, because nothing the walk derives is ever written anywhere.
-    function _derive(IMarketRegistry.Asset memory e) internal view returns (string memory) {
+    function _derive(IMarketRegistry.Asset memory e) internal view returns (address) {
         return walkReg.derive(e);
     }
 

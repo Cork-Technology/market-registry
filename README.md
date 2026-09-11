@@ -2,7 +2,7 @@
 
 The Cork `MarketRegistry` Solidity contracts: the registry itself, the oracle
 adapter factories, the recipe contracts, the cross-chain net-asset-value feed,
-and the 1inch limit-order adapter.
+the 1inch limit-order adapter, and the direct market creator.
 
 ## Prerequisites
 

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.30;
 import {IDefaultCorkController} from "contracts/interfaces/IDefaultCorkController.sol";
+import {IErrors} from "contracts/interfaces/IErrors.sol";
 import {Market, MarketId} from "contracts/interfaces/IPoolManager.sol";
 import {CorkLimitOrderAdapter} from "../../src/CorkLimitOrderAdapter.sol";
 import {Address, IOrderMixin, MakerTraits} from "../../src/interfaces/I1inchLimitOrderProtocol.sol";
@@ -80,12 +81,14 @@ contract MockRateOracle {
     }
 }
 
-/// @dev Multi-market pool manager mock for the JIT hook, mirroring the phoenix surface the
-///      adapter touches: `getId` is the canonical struct hash, `market`/`shares`/`previewMint`
-///      REVERT for an uninitialized market (like the real `CorkPoolManager`, unlike a
-///      zero-returning double), `previewMint` ceil-divides shares (18 dec) into CA native
-///      decimals, and `mint` pulls the CA from `msg.sender` and mints both share legs to
-///      `receiver`. Markets are registered by `createMarket` (called by `MockJITController`).
+/// @dev Multi-market pool manager mock for the JIT hook and the market creator, mirroring the
+///      phoenix surface they touch: `getId` is the canonical struct hash over the whole ten-field
+///      `Market` (fees included, so a different fee derives a different pool, like phoenix),
+///      `market`/`shares`/`previewMint` REVERT for an uninitialized market (like the real
+///      `CorkPoolManager`, unlike a zero-returning double), `previewMint` ceil-divides shares
+///      (18 dec) into CA native decimals, and `mint` pulls the CA from `msg.sender` and mints both
+///      share legs to `receiver`. Markets are registered by `createMarket` (called by
+///      `MockJITController`).
 ///      One cPT/cST pair is deployed up front and shared by every market so tests can name the
 ///      cST address in orders BEFORE the market exists. `setPaused` makes `previewMint` return
 ///      0 (phoenix behavior when paused/expired); `setDriftBps` makes `mint` spend more than
@@ -162,10 +165,12 @@ contract MockJITPoolManager {
     }
 }
 
-/// @dev Stands in for `DefaultCorkController`: records the creation params (fee ORDER is the
-///      footgun under test — `PoolCreationParams` puts the unwind fee before the swap fee) and
+/// @dev Stands in for `DefaultCorkController`: records what the creation call carried — the two
+///      fees now travel INSIDE `pool`, and the suites pin that each lands in its own slot — and
 ///      forwards the market into the mock pool manager, like the real controller forwards into
-///      the real pool manager.
+///      the real pool manager. No role check: the real controller gates `createNewPool` behind
+///      `POOL_CREATOR_ROLE`, which the creator holds; here any caller is accepted, and the suites
+///      pin that the creator is the only one that calls.
 contract MockJITController {
     MockJITPoolManager public poolManager;
 
@@ -178,10 +183,15 @@ contract MockJITController {
         poolManager = poolManager_;
     }
 
+    /// @dev Enforces exactly phoenix's fee rule (`PoolLib.initialize`): either fee at 100% or more
+    ///      is refused with the real `InvalidFees` selector, so a test that expects the revert is
+    ///      checking the selector the real controller would return.
     function createNewPool(IDefaultCorkController.PoolCreationParams calldata params) external {
+        require(params.pool.swapFeePercentage < 100e18, IErrors.InvalidFees());
+        require(params.pool.unwindSwapFeePercentage < 100e18, IErrors.InvalidFees());
         createCalls++;
-        lastUnwindSwapFeePercentage = params.unwindSwapFeePercentage;
-        lastSwapFeePercentage = params.swapFeePercentage;
+        lastUnwindSwapFeePercentage = params.pool.unwindSwapFeePercentage;
+        lastSwapFeePercentage = params.pool.swapFeePercentage;
         lastIsWhitelistEnabled = params.isWhitelistEnabled;
         poolManager.createMarket(params.pool);
     }
@@ -212,11 +222,11 @@ contract MockLimitOrderProtocol {
     }
 }
 
-/// @dev A registered recipe that accepts every constraint, so a test can reach the adapter's own
+/// @dev A registered recipe that accepts every constraint, so a test can reach the creator's own
 ///      creation-time checks without a real recipe rejecting the payload at step 4 first. The
 ///      `RateUnavailable` test needs it: `LiquidityPriceRecipe.verify` reads the live rate and refuses a
-///      zero one, so the adapter's own guard is unreachable through a real recipe.
-///      `PRICE` so the adapter still deploys a wrapper at step 3.
+///      zero one, so the creator's own guard is unreachable through a real recipe.
+///      `PRICE` so the creator still deploys a wrapper at step 3.
 contract PermissiveRecipe is IMarketRecipe {
     function source() external pure returns (RecipeSource) {
         return RecipeSource.PRICE;
@@ -234,16 +244,22 @@ contract PermissiveRecipe is IMarketRecipe {
         return constraint;
     }
 
-    function verify(address, address, address, IMarketRegistry.ResolvedConstraint calldata, bytes calldata)
-        external
-        pure
-        returns (bool)
-    {
+    function verify(
+        address,
+        address,
+        address,
+        uint256,
+        bool,
+        IMarketRegistry.ResolvedConstraint calldata,
+        bytes calldata
+    ) external pure returns (bool) {
         return true;
     }
 }
 
-/// @dev Order construction helpers shared by the JIT tests.
+/// @dev Order construction helpers shared by the JIT tests. An order names the cST address on one
+///      side; the market it belongs to travels separately, nested as the creator's `MarketParams`
+///      inside the hook's `JITMarketParams`.
 library OrderBuilder {
     function build(address maker, address makerAsset, address takerAsset, uint256 makingAmount, uint256 takingAmount)
         internal

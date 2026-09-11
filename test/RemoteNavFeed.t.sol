@@ -17,19 +17,23 @@ import {
 } from "@layerzerolabs/lz-evm-protocol-v2/contracts/interfaces/ILayerZeroEndpointV2.sol";
 import {OptionsBuilder} from "@layerzerolabs/oapp-evm/contracts/oapp/libs/OptionsBuilder.sol";
 import {EVMCallRequestV1, ReadCodecV1} from "@layerzerolabs/oapp-evm/contracts/oapp/libs/ReadCodecV1.sol";
+import {SetConfigParam} from "@layerzerolabs/lz-evm-protocol-v2/contracts/interfaces/IMessageLibManager.sol";
 import {MockLayerZeroEndpoint} from "./mocks/CrosschainMocks.sol";
 
 /// @title RemoteNavFeed.t.sol — the LayerZero-Read-backed Chainlink-style feed
 /// @notice Covers the round lifecycle (`refresh`, timeout, response delivery), the
 ///         learn-and-freeze scale, `lzReceive` guards and response validation, the
-///         staleness gate on `latestRoundData`, out-of-order late answers, and history
-///         via `getRoundData`. Responses are delivered by pranking as the mock endpoint
-///         with the exact `Origin` the read channel would use and a message ABI-encoded
-///         like `VaultRateLens.read`'s return data.
+///         staleness gate on `latestRoundData`, out-of-order late answers, history
+///         via `getRoundData`, constructor validation and endpoint configuration
+///         (gas floor, staleness ceiling, read library and verifier config), and the
+///         permissionless `skipStuckRound` recovery. Responses are delivered by
+///         pranking as the mock endpoint with the exact `Origin` the read channel
+///         would use and a message ABI-encoded like `VaultRateLens.read`'s return data.
 contract RemoteNavFeedTest is Test {
     event NewRound(uint256 indexed roundId, address indexed startedBy, uint256 startedAt);
     event AnswerUpdated(int256 indexed current, uint256 indexed roundId, uint256 updatedAt);
     event AnswerRecorded(int256 answer, uint256 indexed roundId, uint256 updatedAt);
+    event RoundSkipped(uint256 indexed roundId, address indexed skippedBy);
 
     uint32 internal constant READ_CHANNEL = 4_294_967_295;
     uint32 internal constant TARGET_EID = 30_101;
@@ -46,18 +50,39 @@ contract RemoteNavFeedTest is Test {
     RemoteNavFeed internal feed;
     address internal lens = makeAddr("lens");
     address internal vault = makeAddr("vault");
+    address internal readLibrary = makeAddr("read library");
 
     function setUp() public {
         vm.warp(1_777_000_000);
         endpoint = new MockLayerZeroEndpoint();
-        feed = new RemoteNavFeed(
+        feed = _newFeed(GAS_ALLOWANCE, MAX_STALENESS);
+    }
+
+    /// @dev One ReadLib1002-shaped entry: eid READ_CHANNEL, config type 1, opaque bytes.
+    function _readConfig() internal pure returns (SetConfigParam[] memory config) {
+        config = new SetConfigParam[](1);
+        config[0] = SetConfigParam({eid: READ_CHANNEL, configType: 1, config: hex"c0ffee"});
+    }
+
+    /// @dev Baseline constructor call; tests vary one of the validated arguments.
+    function _newFeed(uint128 gasAllowance, uint256 maxStaleness) internal returns (RemoteNavFeed) {
+        return _newFeed(gasAllowance, maxStaleness, readLibrary, _readConfig());
+    }
+
+    function _newFeed(uint128 gasAllowance, uint256 maxStaleness, address readLibrary_, SetConfigParam[] memory config)
+        internal
+        returns (RemoteNavFeed)
+    {
+        return new RemoteNavFeed(
             ILayerZeroEndpointV2(address(endpoint)),
             TARGET_EID,
             lens,
             vault,
             CONFIRMATIONS,
-            GAS_ALLOWANCE,
-            MAX_STALENESS,
+            gasAllowance,
+            maxStaleness,
+            readLibrary_,
+            config,
             DESCRIPTION
         );
     }
@@ -66,31 +91,200 @@ contract RemoteNavFeedTest is Test {
 
     function test_constructor_gasAllowanceBelowFloor_reverts() public {
         vm.expectRevert(abi.encodeWithSelector(IRemoteNavFeed.GasAllowanceTooLow.selector, uint128(59_999)));
-        new RemoteNavFeed(
-            ILayerZeroEndpointV2(address(endpoint)),
-            TARGET_EID,
-            lens,
-            vault,
-            CONFIRMATIONS,
-            59_999,
-            MAX_STALENESS,
-            DESCRIPTION
-        );
+        _newFeed(59_999, MAX_STALENESS);
     }
 
     function test_constructor_gasAllowanceAtFloor_succeeds() public {
-        RemoteNavFeed atFloor = new RemoteNavFeed(
-            ILayerZeroEndpointV2(address(endpoint)),
-            TARGET_EID,
-            lens,
-            vault,
-            CONFIRMATIONS,
-            60_000,
-            MAX_STALENESS,
-            DESCRIPTION
-        );
+        RemoteNavFeed atFloor = _newFeed(60_000, MAX_STALENESS);
         assertEq(atFloor.GAS_ALLOWANCE(), 60_000, "floor value accepted");
         assertEq(atFloor.MIN_GAS_ALLOWANCE(), 60_000, "floor constant");
+    }
+
+    // Regression: the feed configures its own LayerZero libraries and verifier
+    // set at deployment, acting as the application itself, and never appoints a
+    // delegate that could change them later.
+    function test_constructor_appliesReadLibraryAndConfigOnEndpoint() public view {
+        assertEq(feed.READ_LIBRARY(), readLibrary, "read library immutable");
+        assertEq(endpoint.sendLibrary(address(feed), READ_CHANNEL), readLibrary, "send library for the read channel");
+        assertEq(
+            endpoint.receiveLibrary(address(feed), READ_CHANNEL), readLibrary, "receive library for the read channel"
+        );
+        assertEq(endpoint.receiveLibraryGracePeriod(address(feed), READ_CHANNEL), 0, "no grace period");
+
+        SetConfigParam[] memory expected = _readConfig();
+        SetConfigParam[] memory applied = endpoint.config(address(feed), readLibrary);
+        assertEq(applied.length, expected.length, "one config entry");
+        assertEq(applied[0].eid, expected[0].eid, "config eid");
+        assertEq(applied[0].configType, expected[0].configType, "config type");
+        assertEq(applied[0].config, expected[0].config, "config bytes");
+    }
+
+    function test_constructor_registersNoDelegate() public view {
+        assertEq(endpoint.delegates(address(feed)), address(0), "no delegate on the endpoint");
+    }
+
+    function test_constructor_zeroReadLibrary_reverts() public {
+        vm.expectRevert(IRemoteNavFeed.ZeroReadLibrary.selector);
+        _newFeed(GAS_ALLOWANCE, MAX_STALENESS, address(0), _readConfig());
+    }
+
+    function test_constructor_emptyReadConfig_reverts() public {
+        vm.expectRevert(IRemoteNavFeed.EmptyReadConfig.selector);
+        _newFeed(GAS_ALLOWANCE, MAX_STALENESS, readLibrary, new SetConfigParam[](0));
+    }
+
+    // ── skipStuckRound ──────────────────────────────────────────────────────────
+
+    function _self() internal view returns (bytes32) {
+        return bytes32(uint256(uint160(address(feed))));
+    }
+
+    /// @dev Round 1 never verifies: its nonce stays the endpoint's next inbound
+    ///      nonce, so every later response would queue behind it forever.
+    function test_skipStuckRound_clearsUnverifiedGapAfterTimeout() public {
+        uint256 startedAt = vm.getBlockTimestamp();
+        MessagingReceipt memory stuck = feed.refresh();
+        vm.warp(startedAt + feed.SKIP_TIMEOUT());
+
+        vm.expectEmit(true, true, true, true, address(endpoint));
+        emit MockLayerZeroEndpoint.InboundNonceSkipped(READ_CHANNEL, _self(), address(feed), stuck.nonce);
+        vm.expectEmit(true, true, true, true, address(feed));
+        emit RoundSkipped(stuck.nonce, address(this));
+        feed.skipStuckRound();
+
+        assertEq(endpoint.inboundNonce(address(feed), READ_CHANNEL, _self()), stuck.nonce, "gap closed");
+        assertEq(feed.latestRound(), stuck.nonce, "latestRound untouched");
+        IRemoteNavFeed.Round memory round = feed.roundData(uint80(stuck.nonce));
+        assertEq(round.startedAt, uint64(startedAt), "record kept");
+        assertEq(round.updatedAt, 0, "still unanswered");
+        vm.expectRevert(abi.encodeWithSelector(IRemoteNavFeed.NoDataPresent.selector, uint80(stuck.nonce)));
+        feed.getRoundData(uint80(stuck.nonce));
+    }
+
+    function test_skipStuckRound_anyoneCanCall() public {
+        feed.refresh();
+        vm.warp(vm.getBlockTimestamp() + feed.SKIP_TIMEOUT());
+
+        vm.prank(makeAddr("stranger"));
+        feed.skipStuckRound();
+        assertEq(endpoint.inboundNonce(address(feed), READ_CHANNEL, _self()), 1, "skipped by a stranger");
+    }
+
+    /// @dev Two stuck rounds need two calls, in nonce order.
+    function test_skipStuckRound_runOfStuckRounds_oneCallEach() public {
+        feed.refresh();
+        vm.warp(vm.getBlockTimestamp() + 1 hours);
+        feed.refresh();
+        vm.warp(vm.getBlockTimestamp() + feed.SKIP_TIMEOUT());
+
+        feed.skipStuckRound();
+        assertEq(endpoint.inboundNonce(address(feed), READ_CHANNEL, _self()), 1, "first skipped");
+        feed.skipStuckRound();
+        assertEq(endpoint.inboundNonce(address(feed), READ_CHANNEL, _self()), 2, "second skipped");
+    }
+
+    function test_skipStuckRound_nonceVerified_reverts() public {
+        MessagingReceipt memory receipt = feed.refresh();
+        vm.warp(vm.getBlockTimestamp() + feed.SKIP_TIMEOUT());
+        // A verified response is retryable forever and blocks nothing, so the
+        // endpoint's next inbound nonce moves past it to a round that does not exist.
+        endpoint.setVerified(address(feed), READ_CHANNEL, _self(), receipt.nonce, keccak256("payload"));
+
+        vm.expectRevert(abi.encodeWithSelector(IRemoteNavFeed.UnknownRound.selector, uint80(receipt.nonce + 1)));
+        feed.skipStuckRound();
+    }
+
+    function test_skipStuckRound_noRoundStarted_reverts() public {
+        vm.expectRevert(abi.encodeWithSelector(IRemoteNavFeed.UnknownRound.selector, uint80(1)));
+        feed.skipStuckRound();
+    }
+
+    /// @dev Round 1 is stuck; round 2 was verified and delivered out of order.
+    ///      The endpoint still names round 1 as the gap, so round 2 is never the
+    ///      target even though it exists and is old.
+    function test_skipStuckRound_targetsTheGapNotTheNewestRound() public {
+        feed.refresh();
+        vm.warp(vm.getBlockTimestamp() + 1 hours);
+        MessagingReceipt memory second = feed.refresh();
+        endpoint.setVerified(address(feed), READ_CHANNEL, _self(), second.nonce, keccak256("payload"));
+        _deliver(second.nonce, SAMPLE, 1.07e6, ASSET_DECIMALS, 500, vm.getBlockTimestamp());
+        vm.warp(vm.getBlockTimestamp() + feed.SKIP_TIMEOUT());
+
+        vm.expectEmit(true, true, true, true, address(feed));
+        emit RoundSkipped(1, address(this));
+        feed.skipStuckRound();
+
+        assertEq(
+            endpoint.inboundNonce(address(feed), READ_CHANNEL, _self()), 2, "gap closed through the verified round"
+        );
+        assertEq(feed.latestAnsweredRound(), 2, "served answer untouched");
+    }
+
+    function test_skipStuckRound_roundAlreadyAnswered_reverts() public {
+        MessagingReceipt memory receipt = feed.refresh();
+        // Answered without the mock's nonce moving: the belt-and-braces check fires.
+        _deliver(receipt.nonce, SAMPLE, 1.07e6, ASSET_DECIMALS, 500, vm.getBlockTimestamp());
+        vm.warp(vm.getBlockTimestamp() + feed.SKIP_TIMEOUT());
+
+        vm.expectRevert(abi.encodeWithSelector(IRemoteNavFeed.RoundAlreadyAnswered.selector, uint80(receipt.nonce)));
+        feed.skipStuckRound();
+    }
+
+    function test_skipStuckRound_beforeTimeout_reverts() public {
+        MessagingReceipt memory receipt = feed.refresh();
+        vm.warp(vm.getBlockTimestamp() + feed.SKIP_TIMEOUT() - 1);
+
+        vm.expectRevert(abi.encodeWithSelector(IRemoteNavFeed.RoundNotStuck.selector, uint80(receipt.nonce)));
+        feed.skipStuckRound();
+    }
+
+    /// @dev A merely slow response (past ROUND_TIMEOUT, before SKIP_TIMEOUT) is
+    ///      never destroyed.
+    function test_skipStuckRound_afterRoundTimeoutOnly_reverts() public {
+        MessagingReceipt memory receipt = feed.refresh();
+        vm.warp(vm.getBlockTimestamp() + feed.ROUND_TIMEOUT());
+        assertGt(feed.SKIP_TIMEOUT(), feed.ROUND_TIMEOUT(), "skip timeout is the longer one");
+
+        vm.expectRevert(abi.encodeWithSelector(IRemoteNavFeed.RoundNotStuck.selector, uint80(receipt.nonce)));
+        feed.skipStuckRound();
+    }
+
+    // MAX_STALENESS is capped so the staleness addition in `latestRoundData` can
+    // never overflow. Before the cap, `type(uint256).max` deployed fine and every
+    // read then reverted with an unnamed Panic.
+    function test_constructor_maxStalenessAboveCeiling_reverts() public {
+        uint256 tooHigh = feed.MAX_STALENESS_CEILING() + 1;
+        vm.expectRevert(abi.encodeWithSelector(IRemoteNavFeed.MaxStalenessTooHigh.selector, tooHigh));
+        _newFeed(GAS_ALLOWANCE, tooHigh);
+    }
+
+    function test_constructor_maxStalenessUint256Max_reverts() public {
+        vm.expectRevert(abi.encodeWithSelector(IRemoteNavFeed.MaxStalenessTooHigh.selector, type(uint256).max));
+        _newFeed(GAS_ALLOWANCE, type(uint256).max);
+    }
+
+    function test_constructor_maxStalenessAtCeiling_succeeds() public {
+        RemoteNavFeed atCeiling = _newFeed(GAS_ALLOWANCE, feed.MAX_STALENESS_CEILING());
+        assertEq(atCeiling.MAX_STALENESS(), type(uint64).max, "ceiling accepted");
+    }
+
+    /// @dev Control: at the ceiling, the addition of a uint64 timestamp and a
+    ///      uint64-sized bound always fits, so the far end of the range still reads.
+    function test_latestRoundData_maxStalenessAtCeiling_neverOverflows() public {
+        RemoteNavFeed atCeiling = _newFeed(GAS_ALLOWANCE, feed.MAX_STALENESS_CEILING());
+        MessagingReceipt memory receipt = atCeiling.refresh();
+        vm.prank(address(endpoint));
+        atCeiling.lzReceive(
+            Origin({srcEid: READ_CHANNEL, sender: bytes32(uint256(uint160(address(atCeiling)))), nonce: receipt.nonce}),
+            bytes32(0),
+            abi.encode(SAMPLE, 1.07e6, ASSET_DECIMALS, 500, type(uint64).max),
+            address(0),
+            ""
+        );
+
+        vm.warp(type(uint64).max);
+        (, int256 answer,,,) = atCeiling.latestRoundData();
+        assertEq(answer, 1.07e6, "served at the far end of the timestamp range");
     }
 
     function test_description_fromConstructor() public view {

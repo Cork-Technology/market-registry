@@ -34,10 +34,10 @@ import {one} from "./helpers/ArrayHelpers.sol";
 ///
 ///      ## The two-hop intermediate is any REGISTERED denomination, and four tests say so
 ///
-///      `docs/decisions/denomination-and-hop-graph.md` §(d) specifies the two-hop search as "walk the
+///      The design specifies the two-hop search as "walk the
 ///      registered denominations; for each registered unit `u`, if `(from → u)` and `(u → USD)` both
 ///      exist, return that pair", with "registration order decides" as the tie-break. That is what
-///      `resolvePath` does, over `_denominationKeys` (slot 13). An earlier cut probed Ether and nothing
+///      `resolvePath` does, over `_denominationKeys` (slot 12). An earlier cut probed Ether and nothing
 ///      else, because the denomination store had no key array to enumerate; the array is the whole of
 ///      what widened it.
 ///
@@ -64,8 +64,8 @@ import {one} from "./helpers/ArrayHelpers.sol";
 contract HopGraphTest is RegistryFixture {
     // ── units the suite bridges from ───────────────────────────────────────────────
     //
-    // Token-backed labels register to a real token address; `"USD"` / `"ETH"` are seeded by the
-    // constructor to their Chainlink `Denominations` pseudo-addresses.
+    // Token-backed units are real token addresses; US Dollars and Ether are seeded by `initialize`
+    // as their Chainlink `Denominations` pseudo-addresses.
 
     address internal usdcUnit; // "USDC" — one direct hop to US Dollars
     address internal usdtUnit; // "USDT" — one direct hop to US Dollars
@@ -73,7 +73,7 @@ contract HopGraphTest is RegistryFixture {
     address internal midUnit; // "MID" — the NON-Ether intermediate: one direct hop to US Dollars
     address internal farUnit; // "FAR" — two hops from US Dollars, through "MID" and only through it
     address internal deepUnit; // "DEEP" — THREE hops (DEEP → FAR → MID → USD), so over budget always
-    address internal orphanUnit; // "ORPHAN" — a registered label with no outgoing edge at all
+    address internal orphanUnit; // "ORPHAN" — a registered unit with no outgoing edge at all
     address internal inverseUnit; // "INVERSE" — only the WRONG-direction (USD → unit) edge exists
 
     // ── the aggregators sitting on each edge ───────────────────────────────────────
@@ -90,40 +90,40 @@ contract HopGraphTest is RegistryFixture {
         // The one edge every Ether-quoted source and every Ether-bridged two-hop path depends on.
         _addEthUsdFeed();
 
-        // Token-backed units. `_registerDenominationWithUsdFeed` does the label AND the direct
+        // Token-backed units. `_registerDenominationWithUsdFeed` does the unit AND the direct
         // `unit → USD` edge, which is what a one-hop budget needs.
         usdcUnit = _newToken("USDC", 6);
         usdtUnit = _newToken("USDT", 6);
-        _registerDenominationWithUsdFeed("USDC", usdcUnit, usdcUsdAgg);
-        _registerDenominationWithUsdFeed("USDT", usdtUnit, usdtUsdAgg);
+        _registerDenominationWithUsdFeed(usdcUnit, usdcUsdAgg);
+        _registerDenominationWithUsdFeed(usdtUnit, usdtUsdAgg);
 
         // Two hops through Ether: a `stETH → ETH` edge and NO direct `stETH → USD` edge.
         stEthUnit = _newToken("stETH", 18);
-        _registerDenomination("stETH", stEthUnit);
-        _addFeed(stEthUnit, ETH_UNIT, stEthEthAgg, 18);
+        _registerDenomination(stEthUnit);
+        _addFeed(stEthUnit, ETH_UNIT, stEthEthAgg);
 
         // A complete two-hop path whose intermediate is NOT Ether: `FAR → MID → USD`. Both units are
         // registered and both edges exist, and `FAR` has NO edge to Ether — so it resolves only if the
         // search really does walk the registered set.
         midUnit = _newToken("MID", 18);
         farUnit = _newToken("FAR", 18);
-        _registerDenomination("MID", midUnit);
-        _registerDenomination("FAR", farUnit);
-        _addFeed(midUnit, USD_UNIT, midUsdAgg, 8);
-        _addFeed(farUnit, midUnit, farMidAgg, 18);
+        _registerDenomination(midUnit);
+        _registerDenomination(farUnit);
+        _addFeed(midUnit, USD_UNIT, midUsdAgg);
+        _addFeed(farUnit, midUnit, farMidAgg);
 
         // One hop further out: `DEEP → FAR → MID → USD`. Three hops, so no budget reaches it — `DEEP`
         // is the unit that pins the CEILING now that `FAR` resolves.
         deepUnit = _newToken("DEEP", 18);
-        _registerDenomination("DEEP", deepUnit);
-        _addFeed(deepUnit, farUnit, makeAddr("deepFarAggregator"), 18);
+        _registerDenomination(deepUnit);
+        _addFeed(deepUnit, farUnit, makeAddr("deepFarAggregator"));
 
-        // A registered label with nothing leaving it, and one with only the inverse edge.
+        // A registered unit with nothing leaving it, and one with only the inverse edge.
         orphanUnit = _newToken("ORPHAN", 18);
-        _registerDenomination("ORPHAN", orphanUnit);
+        _registerDenomination(orphanUnit);
         inverseUnit = _newToken("INVERSE", 18);
-        _registerDenomination("INVERSE", inverseUnit);
-        _addFeed(USD_UNIT, inverseUnit, makeAddr("usdInverseAggregator"), 8); // WRONG direction on purpose
+        _registerDenomination(inverseUnit);
+        _addFeed(USD_UNIT, inverseUnit, makeAddr("usdInverseAggregator")); // WRONG direction on purpose
     }
 
     // ── level 0: already in US Dollars ─────────────────────────────────────────────
@@ -135,10 +135,10 @@ contract HopGraphTest is RegistryFixture {
     ///      so only the resolved `feed2` distinguishes "no bridge needed" from "a bridge nobody
     ///      noticed was missing".
     function test_hop_zeroHops_usdSourceLeavesTheBridgeSlotEmpty() public {
-        (address ca, address caAgg) = _addPriceAsset("CADOLLAR", "USD");
-        (address ref, address refAgg) = _addPriceAsset("REFDOLLAR", "USD");
+        (address ca, address caAgg) = _addPriceAsset("CADOLLAR", USD_UNIT);
+        (address ref, address refAgg) = _addPriceAsset("REFDOLLAR", USD_UNIT);
 
-        iReg.deploy(ca, ref, IMarketRegistry.OracleMode.PRICE);
+        iReg.deploy(ca, ref, IMarketRegistry.OracleMode.PRICE, bytes32(0));
 
         // REF is the oracle's BASE side and CA is its QUOTE side — orientation is load-bearing.
         assertEq(wrapperFactory.lastBaseFeed1(), refAgg, "base feed1 is the reference asset's aggregator");
@@ -161,10 +161,10 @@ contract HopGraphTest is RegistryFixture {
     /// @dev This is the whole of the budget-1 arithmetic made observable. The `"ETH"`-quoted aggregator
     ///      occupies `feed1` itself, so the one remaining slot carries the `ETH → USD` edge.
     function test_hop_oneHopFeedPath_bridgeLandsInFeed2() public {
-        (address ca, address caAgg) = _addPriceAsset("CAETHER", "ETH");
-        (address ref, address refAgg) = _addPriceAsset("REFDOLLAR2", "USD");
+        (address ca, address caAgg) = _addPriceAsset("CAETHER", ETH_UNIT);
+        (address ref, address refAgg) = _addPriceAsset("REFDOLLAR2", USD_UNIT);
 
-        iReg.deploy(ca, ref, IMarketRegistry.OracleMode.PRICE);
+        iReg.deploy(ca, ref, IMarketRegistry.OracleMode.PRICE, bytes32(0));
 
         assertEq(wrapperFactory.lastQuoteFeed1(), caAgg, "the source itself takes feed1");
         assertEq(wrapperFactory.lastQuoteFeed2(), ethUsdAggregator, "the one bridge hop takes feed2");
@@ -180,14 +180,14 @@ contract HopGraphTest is RegistryFixture {
     ///      two DIFFERENT bridge aggregators is what proves each leg used its own path rather than one
     ///      leg's bridge being reused for both.
     function test_hop_usdCoinAndTetherAssets_reachACommonDenomination() public {
-        (address ca, address caAgg) = _addPriceAsset("CAUSDC", "USDC");
-        (address ref, address refAgg) = _addPriceAsset("REFUSDT", "USDT");
+        (address ca, address caAgg) = _addPriceAsset("CAUSDC", usdcUnit);
+        (address ref, address refAgg) = _addPriceAsset("REFUSDT", usdtUnit);
 
         // Each source states its own denomination, so the two assets genuinely start in different units.
-        assertEq(_storedDenomination(ca, IMarketRegistry.SourceType.PRICE), "USDC");
-        assertEq(_storedDenomination(ref, IMarketRegistry.SourceType.PRICE), "USDT");
+        assertEq(_storedDenomination(ca, IMarketRegistry.SourceType.PRICE), usdcUnit);
+        assertEq(_storedDenomination(ref, IMarketRegistry.SourceType.PRICE), usdtUnit);
 
-        iReg.deploy(ca, ref, IMarketRegistry.OracleMode.PRICE);
+        iReg.deploy(ca, ref, IMarketRegistry.OracleMode.PRICE, bytes32(0));
 
         assertEq(wrapperFactory.lastQuoteFeed1(), caAgg);
         assertEq(wrapperFactory.lastQuoteFeed2(), usdcUsdAgg, "the collateral leg bridges USDC -> USD");
@@ -209,10 +209,10 @@ contract HopGraphTest is RegistryFixture {
     ///      real bug: the vault's integer `convertToAssets(1 wei)` truncates to zero on an offset vault
     ///      and the oracle prices at zero.
     function test_hop_twoHopVaultPath_fillsBothFeedSlotsNearestFirst() public {
-        (address ca, address caVault) = _addNavAsset("CASTETH", "stETH", 18);
-        (address ref,) = _addPriceAsset("REFDOLLAR3", "USD");
+        (address ca, address caVault) = _addNavAsset("CASTETH", stEthUnit, 18);
+        (address ref,) = _addPriceAsset("REFDOLLAR3", USD_UNIT);
 
-        iReg.deploy(ca, ref, IMarketRegistry.OracleMode.NAV);
+        iReg.deploy(ca, ref, IMarketRegistry.OracleMode.NAV, bytes32(0));
 
         assertEq(wrapperFactory.lastQuoteVault(), caVault, "an ERC4626 source occupies the vault slot");
         assertEq(wrapperFactory.lastQuoteSample(), 10 ** 18, "the sample is 10 ** shareDecimals");
@@ -226,10 +226,10 @@ contract HopGraphTest is RegistryFixture {
     ///      US-Dollar-Coin). It also pins that the path length drives which slots are filled — the
     ///      budget is a ceiling, not a required length.
     function test_hop_vaultWithOneHopUnit_leavesFeed2Empty() public {
-        (address ca, address caVault) = _addNavAsset("CAUSDCVAULT", "USDC", 18);
-        (address ref,) = _addPriceAsset("REFDOLLAR4", "USD");
+        (address ca, address caVault) = _addNavAsset("CAUSDCVAULT", usdcUnit, 18);
+        (address ref,) = _addPriceAsset("REFDOLLAR4", USD_UNIT);
 
-        iReg.deploy(ca, ref, IMarketRegistry.OracleMode.NAV);
+        iReg.deploy(ca, ref, IMarketRegistry.OracleMode.NAV, bytes32(0));
 
         assertEq(wrapperFactory.lastQuoteVault(), caVault);
         assertEq(wrapperFactory.lastQuoteFeed1(), usdcUsdAgg, "the single hop takes feed1 on a vault leg");
@@ -239,10 +239,10 @@ contract HopGraphTest is RegistryFixture {
     /// @notice A dollar-quoted VAULT resolves to zero hops: the vault slot is filled and BOTH feed slots
     ///         stay empty, which the Morpho oracle reads as price 1 on each.
     function test_hop_vaultWithDollarUnit_leavesBothFeedSlotsEmpty() public {
-        (address ca, address caVault) = _addNavAsset("CADOLLARVAULT", "USD", 6);
-        (address ref,) = _addPriceAsset("REFDOLLAR5", "USD");
+        (address ca, address caVault) = _addNavAsset("CADOLLARVAULT", USD_UNIT, 6);
+        (address ref,) = _addPriceAsset("REFDOLLAR5", USD_UNIT);
 
-        iReg.deploy(ca, ref, IMarketRegistry.OracleMode.NAV);
+        iReg.deploy(ca, ref, IMarketRegistry.OracleMode.NAV, bytes32(0));
 
         assertEq(wrapperFactory.lastQuoteVault(), caVault);
         assertEq(wrapperFactory.lastQuoteSample(), 10 ** 6, "the sample follows the vault's own decimals");
@@ -259,16 +259,16 @@ contract HopGraphTest is RegistryFixture {
     ///      rather than just the successful add is what proves the path found is the `MID` one and that
     ///      it is wired nearest-the-asset first.
     function test_hop_twoHop_nonEtherIntermediateResolves() public {
-        (address ca, address caVault) = _addNavAsset("CAFAR", "FAR", 18);
-        (address ref,) = _addPriceAsset("REFDOLLAR8", "USD");
+        (address ca, address caVault) = _addNavAsset("CAFAR", farUnit, 18);
+        (address ref,) = _addPriceAsset("REFDOLLAR8", USD_UNIT);
 
         assertEq(
             _storedDenomination(ca, IMarketRegistry.SourceType.NAV),
-            "FAR",
+            farUnit,
             "the add is accepted at write time, not merely at deploy"
         );
 
-        iReg.deploy(ca, ref, IMarketRegistry.OracleMode.NAV);
+        iReg.deploy(ca, ref, IMarketRegistry.OracleMode.NAV, bytes32(0));
 
         assertEq(wrapperFactory.lastQuoteVault(), caVault, "the vault still occupies the orthogonal slot");
         assertEq(wrapperFactory.lastQuoteFeed1(), farMidAgg, "feed1 is FAR -> MID, the hop nearest the asset");
@@ -278,24 +278,24 @@ contract HopGraphTest is RegistryFixture {
     /// @notice REMOVING the denomination a two-hop path bridges through breaks that path, even though
     ///         both conversion-feed edges are still approved.
     /// @dev The candidate list `resolvePath` walks is the DENOMINATION set, not the feed store — so a
-    ///      label removal shrinks the search directly. This is the teeth on `removeDenominations`: the
+    ///      unit removal shrinks the search directly. This is the teeth on `removeDenominations`: the
     ///      `FAR → MID` and `MID → USD` edges survive untouched and are simply never tried, because
     ///      nothing names `MID` as a unit any more. The already-stored asset keeps its entry and starts
     ///      failing at `deploy`, exactly as removing an edge does.
     function test_hop_removingTheIntermediateDenominationBreaksTheTwoHopPath() public {
-        (address ca,) = _addNavAsset("CAFAR", "FAR", 18);
-        (address ref,) = _addPriceAsset("REFDOLLAR8", "USD");
+        (address ca,) = _addNavAsset("CAFAR", farUnit, 18);
+        (address ref,) = _addPriceAsset("REFDOLLAR8", USD_UNIT);
 
-        iReg.deploy(ca, ref, IMarketRegistry.OracleMode.NAV); // proves the path resolves first
+        iReg.deploy(ca, ref, IMarketRegistry.OracleMode.NAV, bytes32(0)); // proves the path resolves first
         assertEq(wrapperFactory.lastQuoteFeed2(), midUsdAgg, "setup: the MID bridge should be in use");
 
         // A second FAR-quoted asset, stored while the path still resolves and deliberately NOT deployed
         // yet — `deploy` is idempotent, so an already-deployed pair would short-circuit and prove nothing.
-        (address ca2,) = _addNavAsset("CAFAR2", "FAR", 18);
+        (address ca2,) = _addNavAsset("CAFAR2", farUnit, 18);
 
-        iReg.removeDenominations(one("MID"));
+        iReg.removeDenominations(one(midUnit));
 
-        // Both conversion-feed edges survive untouched. It is the intermediate LABEL that is gone, and
+        // Both conversion-feed edges survive untouched. It is the intermediate UNIT that is gone, and
         // that alone is enough: `resolvePath` walks the denomination set, so `MID` is never tried.
         (bool midUsdStillThere,) = iReg.lookupConversionFeed(midUnit, USD_UNIT);
         assertTrue(midUsdStillThere, "the MID -> USD edge must survive the label removal");
@@ -305,14 +305,14 @@ contract HopGraphTest is RegistryFixture {
         // The stored asset keeps its entry and fails at deploy.
         assertTrue(iReg.isAsset(ca2), "the asset must survive the label removal");
         vm.expectRevert(abi.encodeWithSelector(IMarketRegistry.NoConversionPathToUsd.selector, farUnit, uint256(2)));
-        iReg.deploy(ca2, ref, IMarketRegistry.OracleMode.NAV);
+        iReg.deploy(ca2, ref, IMarketRegistry.OracleMode.NAV, bytes32(0));
 
         // And a NEW FAR-quoted asset can no longer be written at all. The two tokens are deployed BEFORE
         // the cheatcode: a contract creation would consume the armed `expectRevert`.
         address token3 = _newToken("CAFAR3", 18);
         address vault3 = _newToken("CAFAR3Vault", 18);
         vm.expectRevert(abi.encodeWithSelector(IMarketRegistry.NoConversionPathToUsd.selector, farUnit, uint256(2)));
-        iReg.addAssets(one(mkNavOnlyAsset(token3, "CAFAR3", vault3, "FAR")));
+        iReg.addAssets(one(mkNavOnlyAsset(token3, "CAFAR3", vault3, farUnit)));
     }
 
     /// @notice When two registered intermediates both complete a path, the EARLIER-REGISTERED one wins —
@@ -333,8 +333,8 @@ contract HopGraphTest is RegistryFixture {
         address unitB = _newToken("INTERB", 18);
         address aUsdAgg = makeAddr("interAUsdAggregator");
         address bUsdAgg = makeAddr("interBUsdAggregator");
-        _registerDenominationWithUsdFeed("INTERA", unitA, aUsdAgg);
-        _registerDenominationWithUsdFeed("INTERB", unitB, bUsdAgg);
+        _registerDenominationWithUsdFeed(unitA, aUsdAgg);
+        _registerDenominationWithUsdFeed(unitB, bUsdAgg);
 
         address toAAgg = makeAddr("forkAbToAAggregator");
         address toBAgg = makeAddr("forkAbToBAggregator");
@@ -348,8 +348,8 @@ contract HopGraphTest is RegistryFixture {
         address unitD = _newToken("INTERD", 18);
         address cUsdAgg = makeAddr("interCUsdAggregator");
         address dUsdAgg = makeAddr("interDUsdAggregator");
-        _registerDenominationWithUsdFeed("INTERD", unitD, dUsdAgg); // registered FIRST
-        _registerDenominationWithUsdFeed("INTERC", unitC, cUsdAgg);
+        _registerDenominationWithUsdFeed(unitD, dUsdAgg); // registered FIRST
+        _registerDenominationWithUsdFeed(unitC, cUsdAgg);
 
         address toCAgg = makeAddr("forkCdToCAggregator");
         address toDAgg = makeAddr("forkCdToDAggregator");
@@ -374,13 +374,13 @@ contract HopGraphTest is RegistryFixture {
     ///      well formed, so nothing in `addConversionFeed` refuses it.
     function test_hop_twoHop_usdSentinelIsNeverAnIntermediate() public {
         address usdSelfAgg = makeAddr("usdSelfLoopAggregator");
-        _addFeed(USD_UNIT, USD_UNIT, usdSelfAgg, 8);
+        _addFeed(USD_UNIT, USD_UNIT, usdSelfAgg);
 
         // Budget 2 and a unit — `USDC` — that has a direct dollar edge, so the loop is reachable.
-        (address ca, address caVault) = _addNavAsset("CAUSDCSENTINEL", "USDC", 18);
-        (address ref,) = _addPriceAsset("REFDOLLAR9", "USD");
+        (address ca, address caVault) = _addNavAsset("CAUSDCSENTINEL", usdcUnit, 18);
+        (address ref,) = _addPriceAsset("REFDOLLAR9", USD_UNIT);
 
-        iReg.deploy(ca, ref, IMarketRegistry.OracleMode.NAV);
+        iReg.deploy(ca, ref, IMarketRegistry.OracleMode.NAV, bytes32(0));
 
         assertEq(wrapperFactory.lastQuoteVault(), caVault);
         assertEq(wrapperFactory.lastQuoteFeed1(), usdcUsdAgg, "one hop, answered at level 1");
@@ -398,8 +398,8 @@ contract HopGraphTest is RegistryFixture {
     ///      cannot invert one, so the inverse has to be approved as its own entry.
     function test_hop_twoHop_backwardEdgeThroughAnIntermediateIsNotFollowed() public {
         address backwardUnit = _newToken("BACKWARD", 18);
-        _registerDenomination("BACKWARD", backwardUnit);
-        _addFeed(usdcUnit, backwardUnit, makeAddr("usdcBackwardAggregator"), 18); // WRONG direction on purpose
+        _registerDenomination(backwardUnit);
+        _addFeed(usdcUnit, backwardUnit, makeAddr("usdcBackwardAggregator")); // WRONG direction on purpose
 
         address token = _newToken("BACKTOKEN", 18);
         address vault = _newToken("BACKVAULT", 18);
@@ -407,7 +407,7 @@ contract HopGraphTest is RegistryFixture {
         vm.expectRevert(
             abi.encodeWithSelector(IMarketRegistry.NoConversionPathToUsd.selector, backwardUnit, uint256(2))
         );
-        iReg.addAssets(one(mkNavOnlyAsset(token, "BACKASSET", vault, "BACKWARD")));
+        iReg.addAssets(one(mkNavOnlyAsset(token, "BACKASSET", vault, backwardUnit)));
     }
 
     /// @notice Ether itself cannot use the two-hop level — there is no `ETH → ETH` edge to take — so an
@@ -427,10 +427,10 @@ contract HopGraphTest is RegistryFixture {
         address token = _newToken("ETHTOKEN", 18);
         address vault = _newToken("ETHVAULT", 18);
 
-        // `"ETH"` is a seeded LABEL, so this gets past the registration check and fails on the PATH —
+        // Ether is a seeded UNIT, so this gets past the registration check and fails on the PATH —
         // with the vault's full budget of 2, which is what makes the self-bridge guard visible.
         vm.expectRevert(abi.encodeWithSelector(IMarketRegistry.NoConversionPathToUsd.selector, ETH_UNIT, uint256(2)));
-        fresh.addAssets(one(mkNavOnlyAsset(token, "ETHASSET", vault, "ETH")));
+        fresh.addAssets(one(mkNavOnlyAsset(token, "ETHASSET", vault, ETH_UNIT)));
     }
 
     // ── the budget: 1 for AGGREGATOR_V3, 2 for ERC4626 ──────────────────────────────
@@ -448,13 +448,13 @@ contract HopGraphTest is RegistryFixture {
 
         // Budget 1 — the error carries `maxHops == 1`.
         vm.expectRevert(abi.encodeWithSelector(IMarketRegistry.NoConversionPathToUsd.selector, stEthUnit, uint256(1)));
-        iReg.addAssets(one(mkPriceOnlyAsset(token, "BUDGETASSET", makeAddr("stEthPriceAgg"), "stETH")));
+        iReg.addAssets(one(mkPriceOnlyAsset(token, "BUDGETASSET", makeAddr("stEthPriceAgg"), stEthUnit)));
 
         // Budget 2 — the identical unit resolves.
-        iReg.addAssets(one(mkNavOnlyAsset(token, "BUDGETASSET", _newToken("BUDGETVAULT", 18), "stETH")));
+        iReg.addAssets(one(mkNavOnlyAsset(token, "BUDGETASSET", _newToken("BUDGETVAULT", 18), stEthUnit)));
         assertEq(
             _storedDenomination(token, IMarketRegistry.SourceType.NAV),
-            "stETH",
+            stEthUnit,
             "the vault's budget of 2 reaches US Dollars"
         );
     }
@@ -472,14 +472,14 @@ contract HopGraphTest is RegistryFixture {
         address vault = _newToken("OVERVAULT", 18);
 
         vm.expectRevert(abi.encodeWithSelector(IMarketRegistry.NoConversionPathToUsd.selector, deepUnit, uint256(2)));
-        iReg.addAssets(one(mkNavOnlyAsset(token, "OVERASSET", vault, "DEEP")));
+        iReg.addAssets(one(mkNavOnlyAsset(token, "OVERASSET", vault, deepUnit)));
     }
 
     // ── the failure lands at WRITE time ─────────────────────────────────────────────
 
     /// @notice A source with no dollar path fails LOUDLY at `addAsset`. Nothing is stored, so `deploy`
     ///         never gets the chance to be the one that discovers it.
-    /// @dev The whole point of moving the check earlier (#75). The assertion has three parts and all
+    /// @dev The whole point of moving the check earlier. The assertion has three parts and all
     ///      three are needed:
     ///
     ///      1. `addAsset` reverts `NoConversionPathToUsd`, naming the unit and the budget;
@@ -491,17 +491,17 @@ contract HopGraphTest is RegistryFixture {
     ///         "rejected at write time" from "rejected eventually".
     function test_hop_unreachableSource_failsAtAddAssetNotAtDeploy() public {
         address token = _newToken("ORPHANTOKEN", 18);
-        (address ref,) = _addPriceAsset("REFDOLLAR6", "USD");
+        (address ref,) = _addPriceAsset("REFDOLLAR6", USD_UNIT);
 
         vm.expectRevert(abi.encodeWithSelector(IMarketRegistry.NoConversionPathToUsd.selector, orphanUnit, uint256(1)));
-        iReg.addAssets(one(mkPriceOnlyAsset(token, "ORPHANASSET", makeAddr("orphanAgg"), "ORPHAN")));
+        iReg.addAssets(one(mkPriceOnlyAsset(token, "ORPHANASSET", makeAddr("orphanAgg"), orphanUnit)));
 
         (bool found,) = iReg.lookupAssetByAddress(token);
         assertFalse(found, "an unreachable source must leave nothing in the store");
 
         // Not `NoConversionPathToUsd`: there is no entry for `deploy` to trip over in the first place.
         vm.expectRevert(IMarketRegistry.EntryNotFound.selector);
-        iReg.deploy(token, ref, IMarketRegistry.OracleMode.PRICE);
+        iReg.deploy(token, ref, IMarketRegistry.OracleMode.PRICE, bytes32(0));
     }
 
     /// @notice Only FORWARD edges are followed. A `USD → unit` feed does not bridge `unit`.
@@ -515,22 +515,23 @@ contract HopGraphTest is RegistryFixture {
         address vault = _newToken("INVVAULT", 18);
 
         vm.expectRevert(abi.encodeWithSelector(IMarketRegistry.NoConversionPathToUsd.selector, inverseUnit, uint256(1)));
-        iReg.addAssets(one(mkPriceOnlyAsset(token, "INVASSET", makeAddr("invAgg"), "INVERSE")));
+        iReg.addAssets(one(mkPriceOnlyAsset(token, "INVASSET", makeAddr("invAgg"), inverseUnit)));
 
         vm.expectRevert(abi.encodeWithSelector(IMarketRegistry.NoConversionPathToUsd.selector, inverseUnit, uint256(2)));
-        iReg.addAssets(one(mkNavOnlyAsset(token, "INVASSET", vault, "INVERSE")));
+        iReg.addAssets(one(mkNavOnlyAsset(token, "INVASSET", vault, inverseUnit)));
     }
 
-    /// @notice The REGISTRATION check runs before the PATH check: an unregistered label reports itself
+    /// @notice The REGISTRATION check runs before the PATH check: an unregistered unit reports itself
     ///         as unregistered, not as unreachable.
-    /// @dev Ordering matters for the reader of the revert. A typo'd label has no unit to resolve, so
-    ///      reporting `NoConversionPathToUsd` for it would name the zero address and send whoever hit it
-    ///      looking for a missing conversion feed instead of a missing registration.
-    function test_hop_unregisteredLabel_reportsRegistrationNotReachability() public {
+    /// @dev Ordering matters for the reader of the revert. A unit that was never registered has no
+    ///      business in the bridge search, so reporting `NoConversionPathToUsd` for it would send
+    ///      whoever hit it looking for a missing conversion feed instead of a missing registration.
+    function test_hop_unregisteredUnit_reportsRegistrationNotReachability() public {
         address token = _newToken("TYPOTOKEN", 18);
+        address unregisteredUnit = _newToken("UNREGUNIT", 6);
 
-        vm.expectRevert(abi.encodeWithSelector(IMarketRegistry.UnregisteredDenomination.selector, "usdc"));
-        iReg.addAssets(one(mkPriceOnlyAsset(token, "TYPOASSET", makeAddr("typoAgg"), "usdc")));
+        vm.expectRevert(abi.encodeWithSelector(IMarketRegistry.UnregisteredDenomination.selector, unregisteredUnit));
+        iReg.addAssets(one(mkPriceOnlyAsset(token, "TYPOASSET", makeAddr("typoAgg"), unregisteredUnit)));
     }
 
     /// @notice BOTH sources are path-checked, not only the one a future `deploy` might select.
@@ -544,8 +545,8 @@ contract HopGraphTest is RegistryFixture {
             token,
             "HALFASSET",
             IMarketRegistry.AssetKind.ERC4626,
-            mkPriceSource(makeAddr("halfAgg"), "USD"), // reachable in zero hops
-            mkNavSource(_newToken("HALFVAULT", 18), "ORPHAN") // unreachable at any budget
+            mkPriceSource(makeAddr("halfAgg"), USD_UNIT), // reachable in zero hops
+            mkNavSource(_newToken("HALFVAULT", 18), orphanUnit) // unreachable at any budget
         );
 
         vm.expectRevert(abi.encodeWithSelector(IMarketRegistry.NoConversionPathToUsd.selector, orphanUnit, uint256(2)));
@@ -560,8 +561,8 @@ contract HopGraphTest is RegistryFixture {
     ///      `resolvePath` against the graph as it stands at deploy time. Withdrawing an edge the live
     ///      assets depend on is a governance action with teeth.
     function test_hop_removingAnEdgeBreaksDeployButNotTheStoredAsset() public {
-        (address ca,) = _addPriceAsset("CAETHER2", "ETH");
-        (address ref,) = _addPriceAsset("REFDOLLAR7", "USD");
+        (address ca,) = _addPriceAsset("CAETHER2", ETH_UNIT);
+        (address ref,) = _addPriceAsset("REFDOLLAR7", USD_UNIT);
 
         iReg.removeConversionFeeds(one(ETH_UNIT), one(USD_UNIT));
 
@@ -569,44 +570,44 @@ contract HopGraphTest is RegistryFixture {
         assertTrue(found, "removal of an edge must not remove the assets that used it");
         assertEq(
             _storedDenomination(ca, IMarketRegistry.SourceType.PRICE),
-            "ETH",
+            ETH_UNIT,
             "the stored source denomination is untouched"
         );
 
         vm.expectRevert(abi.encodeWithSelector(IMarketRegistry.NoConversionPathToUsd.selector, ETH_UNIT, uint256(1)));
-        iReg.deploy(ca, ref, IMarketRegistry.OracleMode.PRICE);
+        iReg.deploy(ca, ref, IMarketRegistry.OracleMode.PRICE, bytes32(0));
     }
 
     // ── internal helpers ────────────────────────────────────────────────────────────
 
     /// @dev Add a price-source asset denominated in `denomination`, and return `(token, aggregator)`.
     ///      The token is a {MockERC20} because the deploy path re-reads its `decimals()` live. Nothing
-    ///      is derived at write time any more — `addAsset` stores the label the source states, verbatim,
-    ///      once it has checked that the label is registered and reaches US Dollars in one hop.
-    function _addPriceAsset(string memory name, string memory denomination) internal returns (address, address) {
+    ///      is derived at write time any more — `addAsset` stores the unit the source states, verbatim,
+    ///      once it has checked that the unit is registered and reaches US Dollars in one hop.
+    function _addPriceAsset(string memory name, address denomination) internal returns (address, address) {
         address token = _newToken(name, 18);
         address aggregator = makeAddr(string.concat(name, "Aggregator"));
         iReg.addAssets(one(mkPriceOnlyAsset(token, name, aggregator, denomination)));
         return (token, aggregator);
     }
 
-    /// @dev Register a fresh unit labelled `tag` with a complete two-hop path through BOTH `interA` and
+    /// @dev Register a fresh unit named `tag` with a complete two-hop path through BOTH `interA` and
     ///      `interB`, put a vault asset on it, deploy against a dollar reference, and return the
     ///      `(feed1, feed2)` the registry actually chose. The two candidate edges are added in argument
     ///      order — `interA` first — which is what lets the caller separate "the first edge added" from
-    ///      "the first label registered" by varying only the registration order between calls.
+    ///      "the first unit registered" by varying only the registration order between calls.
     function _observeTwoHopChoice(string memory tag, address interA, address aggA, address interB, address aggB)
         internal
         returns (address feed1, address feed2)
     {
         address unit = _newToken(string.concat(tag, "UNIT"), 18);
-        _registerDenomination(tag, unit);
-        _addFeed(unit, interA, aggA, 18);
-        _addFeed(unit, interB, aggB, 18);
+        _registerDenomination(unit);
+        _addFeed(unit, interA, aggA);
+        _addFeed(unit, interB, aggB);
 
-        (address ca,) = _addNavAsset(string.concat("CA", tag), tag, 18);
-        (address ref,) = _addPriceAsset(string.concat("REF", tag), "USD");
-        iReg.deploy(ca, ref, IMarketRegistry.OracleMode.NAV);
+        (address ca,) = _addNavAsset(string.concat("CA", tag), unit, 18);
+        (address ref,) = _addPriceAsset(string.concat("REF", tag), USD_UNIT);
+        iReg.deploy(ca, ref, IMarketRegistry.OracleMode.NAV, bytes32(0));
 
         return (wrapperFactory.lastQuoteFeed1(), wrapperFactory.lastQuoteFeed2());
     }
@@ -614,7 +615,7 @@ contract HopGraphTest is RegistryFixture {
     /// @dev Add a NAV-source asset denominated in `denomination`, and return `(token, vault)`. The vault
     ///      is a separate {MockERC20} because `_wireLeg` reads SHARE decimals off the source address
     ///      itself to build the conversion sample; `vaultDecimals` is what that sample is `10 **`.
-    function _addNavAsset(string memory name, string memory denomination, uint8 vaultDecimals)
+    function _addNavAsset(string memory name, address denomination, uint8 vaultDecimals)
         internal
         returns (address, address)
     {

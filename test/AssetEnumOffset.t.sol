@@ -17,11 +17,13 @@ import {one} from "./helpers/ArrayHelpers.sol";
 ///         produces an out-of-range ordinal in the first place. There is no compiler error, no revert,
 ///         and no failing assertion anywhere. Only a suite that hand-patches the calldata can see it.
 ///
-///         This has already happened TWICE. First: the predecessor hard-coded `96` for `kind` against
-///         the head `addr:0, chainId:32, name-offset:64, kind:96`; dropping `chainId` from `Asset` moved
-///         `kind` to `64`. Then: deleting the asset-level `denomination`, which sat between `kind` and
-///         `priceSource`, moved the two nested-SOURCE offset words down from 128/160 to 96/128 while
-///         leaving `kind` alone. Neither one-word shift left a trace of any kind.
+///         This has already happened THREE times. First: the predecessor hard-coded `96` for `kind`
+///         against the head `addr:0, chainId:32, name-offset:64, kind:96`; dropping `chainId` from
+///         `Asset` moved `kind` to `64`. Then: deleting the asset-level `denomination`, which sat between
+///         `kind` and `priceSource`, moved the two nested-SOURCE offset words down from 128/160 to 96/128
+///         while leaving `kind` alone. Then: turning `AssetSource.denomination` from a string into an
+///         address made each source a STATIC tuple, so the two offset words disappeared and the sources
+///         moved INLINE into the head at 96 and 224. None of those shifts left a trace of any kind.
 ///
 /// @dev ## How this differs from the enum tests in `AssetStore.t.sol`
 ///
@@ -53,23 +55,21 @@ import {one} from "./helpers/ArrayHelpers.sol";
 ///      moved once already when `addAsset` became `addAssets` and a stale constant does not fail
 ///      loudly. It lands on a different word, and an out-of-range enum then PASSES the check.
 ///
-///      Whatever `_tupleHead` returns is the value the library's assembly sees as `e`. Its head is FIVE
-///      words, because `name` and BOTH `AssetSource` members are dynamic (each source contains a
-///      `string`), so each contributes an OFFSET word rather than its data:
+///      Whatever `_tupleHead` returns is the value the library's assembly sees as `e`. Its head is
+///      ELEVEN words. Only `name` is dynamic; each `AssetSource` is a STATIC four-word tuple (its
+///      `denomination` is an address), so both sources are laid out INLINE rather than behind an
+///      offset word:
 ///
-///          addr:0 · name-offset:32 · kind:64 · priceSource-offset:96 · navSource-offset:128
+///          addr:0 · name-offset:32 · kind:64
+///          priceSource: addr:96 · sourceType:128 · sourceInterface:160 · denomination:192
+///          navSource:   addr:224 · sourceType:256 · sourceInterface:288 · denomination:320
 ///
-///      It used to be SIX words. Deleting the asset-level `denomination`, which sat between `kind` and
-///      `priceSource`, removed one offset word from the middle of the head: `kind` stayed exactly where
-///      it was at 64, and the two nested-source offset words moved DOWN one word each, from 128/160 to
-///      96/128. That is precisely the kind of one-word shift this suite exists to catch, because it
-///      leaves no other trace anywhere.
+///      It used to be FIVE words with the two sources behind offset words at 96 and 128, back when a
+///      source carried a `string` denomination. Making the source static removed the indirection: a
+///      source head now sits at a FIXED offset from the tuple head, and `_priceHead` / `_navHead` add
+///      that constant instead of reading an offset word. Each source head is four words:
 ///
-///      An offset inside a tuple is relative to that tuple's own start, so a source head sits at
-///      `tupleHead + word(tupleHead + <offsetWord>)`. Each source head is four words and is UNMOVED —
-///      renaming `quoteUnit` to `denomination` changed the label and nothing else:
-///
-///          addr:0 · sourceType:32 · sourceInterface:64 · denomination-offset:96
+///          addr:0 · sourceType:32 · sourceInterface:64 · denomination:96
 ///
 ///      All three enums have exactly TWO members, so `0` and `1` are in range and `2` and up are not.
 contract AssetEnumOffsetTest is RegistryFixture {
@@ -82,11 +82,11 @@ contract AssetEnumOffsetTest is RegistryFixture {
     }
 
     /// @dev Word positions inside the `Asset` head, as byte offsets from the tuple head. `KIND_WORD`
-    ///      did NOT move when the asset-level `denomination` was deleted; the two source offset words
-    ///      did, and none of the three moved when the argument became an array.
+    ///      has not moved through any of the three layout changes; the two source heads are now
+    ///      INLINE at fixed offsets rather than behind offset words.
     uint256 internal constant KIND_WORD = 64;
-    uint256 internal constant PRICE_SOURCE_OFFSET_WORD = 96;
-    uint256 internal constant NAV_SOURCE_OFFSET_WORD = 128;
+    uint256 internal constant PRICE_SOURCE_HEAD = 96;
+    uint256 internal constant NAV_SOURCE_HEAD = 224;
 
     /// @dev Word positions inside an `AssetSource` head, as byte offsets from that head.
     uint256 internal constant SOURCE_ADDR = 0;
@@ -242,7 +242,7 @@ contract AssetEnumOffsetTest is RegistryFixture {
     // ── SourceType / SourceInterface on the NAV source: offset word 128 ──────────────
 
     /// @notice An out-of-range `SourceType` in the NAV source reverts `Panic(0x21)`.
-    /// @dev The nav source's head offset is a SEPARATELY hard-coded word (128), so it goes stale
+    /// @dev The nav source's head offset is a SEPARATELY hard-coded constant (224), so it goes stale
     ///      independently of the price source's.
     function test_enumOffset_navSourceType_outOfRangeOrdinalPanics() public {
         bytes memory cd = _dualSourceCalldata();
@@ -256,8 +256,8 @@ contract AssetEnumOffsetTest is RegistryFixture {
     ///         `SourceTypeMismatch(NAV, PRICE)` — the MIRROR of the price-source case.
     /// @dev The pair of arguments is the whole point. `(NAV, PRICE)` here against `(PRICE, NAV)` in
     ///      `test_enumOffset_priceSourceType_validOrdinalHitsTheFieldsOwnCheck` proves the two source
-    ///      heads resolve to two different places. Had offset words 96 and 128 both been read as the
-    ///      same head, both tests would still panic on an out-of-range ordinal and only this pair would
+    ///      heads resolve to two different places. Had offsets 96 and 224 both been read as the same
+    ///      head, both tests would still panic on an out-of-range ordinal and only this pair would
     ///      notice.
     function test_enumOffset_navSourceType_validOrdinalHitsTheFieldsOwnCheck() public {
         bytes memory cd = _dualSourceCalldata();
@@ -288,8 +288,7 @@ contract AssetEnumOffsetTest is RegistryFixture {
     ///      enums, so checking it costs a comparison and never rejects an honest caller. A hostile
     ///      encoder can put anything there, and those words are read back by every consumer that decodes
     ///      a stored `Asset`. This also re-checks the nav head offset against a DIFFERENT encoding — an
-    ///      absent source's `denomination` is the empty string, which shortens the tail and moves the
-    ///      head.
+    ///      absent source's words are all zero, which is exactly what a hostile encoder would not send.
     function test_enumOffset_absentSource_isStillRangeChecked() public {
         bytes memory cd = _priceOnlyCalldata();
         _patchWord(cd, _navHead(cd) + SOURCE_TYPE, 2);
@@ -332,11 +331,11 @@ contract AssetEnumOffsetTest is RegistryFixture {
     }
 
     /// @dev An `addAssets` call with BOTH source slots present, each carrying its own matching
-    ///      `sourceType` and the same `"USD"` denomination. Both present is what makes the two source
-    ///      heads distinguishable, and `"USD"` is what makes the unpatched control succeed: it is seeded
-    ///      into the denomination registry by the constructor and resolves to US Dollars in zero hops.
+    ///      `sourceType` and the same US Dollar denomination. Both present is what makes the two source
+    ///      heads distinguishable, and US Dollars is what makes the unpatched control succeed: it is
+    ///      seeded into the denomination set by `initialize` and resolves to US Dollars in zero hops.
     ///
-    ///      The two sources naming the SAME label is a convenience here, not a requirement — each
+    ///      The two sources quoting the SAME unit is a convenience here, not a requirement — each
     ///      present source is validated on its own and the registry never compares them.
     ///
     ///      ONE element, always. The offsets this suite patches are computed for element 0 of a
@@ -350,14 +349,14 @@ contract AssetEnumOffsetTest is RegistryFixture {
                     token,
                     "ENUMASSET",
                     IMarketRegistry.AssetKind.ERC20,
-                    mkPriceSource(priceAggregator, "USD"),
-                    mkNavSource(navVault, "USD")
+                    mkPriceSource(priceAggregator, USD_UNIT),
+                    mkNavSource(navVault, USD_UNIT)
                 )
             )
         );
     }
 
-    /// @dev An `addAssets` call whose NAV slot is ABSENT — a zeroed struct with an empty `denomination`.
+    /// @dev An `addAssets` call whose NAV slot is ABSENT — a zeroed struct with a zero `denomination`.
     function _priceOnlyCalldata() internal view returns (bytes memory) {
         return abi.encodeWithSelector(
             IMarketRegistry.addAssets.selector,
@@ -366,25 +365,23 @@ contract AssetEnumOffsetTest is RegistryFixture {
                     token,
                     "ENUMASSET",
                     IMarketRegistry.AssetKind.ERC20,
-                    mkPriceSource(priceAggregator, "USD"),
+                    mkPriceSource(priceAggregator, USD_UNIT),
                     noSource()
                 )
             )
         );
     }
 
-    /// @dev Absolute byte offset of the PRICE source's head. Read from the encoding rather than
-    ///      hard-coded, because a tuple-internal offset is relative to the tuple and moves with the
-    ///      length of `name`.
+    /// @dev Absolute byte offset of the PRICE source's head. A static tuple sits inline, so this is a
+    ///      fixed distance from the tuple head — no offset word to read, and `name`'s length does not
+    ///      move it.
     function _priceHead(bytes memory cd) internal pure returns (uint256) {
-        uint256 head = _tupleHead(cd);
-        return head + _readWord(cd, head + PRICE_SOURCE_OFFSET_WORD);
+        return _tupleHead(cd) + PRICE_SOURCE_HEAD;
     }
 
     /// @dev Absolute byte offset of the NAV source's head.
     function _navHead(bytes memory cd) internal pure returns (uint256) {
-        uint256 head = _tupleHead(cd);
-        return head + _readWord(cd, head + NAV_SOURCE_OFFSET_WORD);
+        return _tupleHead(cd) + NAV_SOURCE_HEAD;
     }
 
     function _readWord(bytes memory cd, uint256 byteOffset) internal pure returns (uint256 w) {

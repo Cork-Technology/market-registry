@@ -11,3 +11,6 @@
 [submodule "lib/phoenix"]
 	path = lib/phoenix
 	url = https://github.com/Cork-Technology/phoenix
+[submodule "lib/forge-std"]
+	path = lib/forge-std
+	url = https://github.com/foundry-rs/forge-std

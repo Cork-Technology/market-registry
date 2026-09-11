@@ -11,7 +11,7 @@ import {one} from "./helpers/ArrayHelpers.sol";
 /// @notice Clamping semantics for `getConversionFeeds`: the slice is [offset, offset+limit) clamped to
 ///         the array length; an offset at or past the end yields an empty page; a limit past the end is
 ///         truncated; and `total` always reports the full count regardless of the page window.
-/// @dev Wrappers are not enumerable (they are keyed by pair + resolved sources and read one at a time
+/// @dev Wrappers are not enumerable (they are keyed by pair, mode and wiring and read one at a time
 ///      via `lookupWrapper`), so the conversion-feed store is the cheapest pagination subject: its
 ///      entries need no denomination registration, no dollar path, and no probe-safe address. The same
 ///      `MarketRegistryLib.pageBounds` clamp backs `getAssets` and `getRecipes`, so exercising it once
@@ -44,7 +44,6 @@ contract PaginationTest is Test {
             f.base = makeAddr(string(abi.encodePacked("base", i)));
             f.quote = makeAddr(string(abi.encodePacked("quote", i)));
             f.aggregatorAddress = makeAddr(string(abi.encodePacked("agg", i)));
-            f.feedDecimals = 8;
             vm.prank(owner);
             reg.addConversionFeeds(one(f));
         }

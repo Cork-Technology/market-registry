@@ -8,6 +8,7 @@ import {RemoteNavFeedFactory} from "../src/crosschain/RemoteNavFeedFactory.sol";
 import {IRemoteNavFeed} from "../src/interfaces/IRemoteNavFeed.sol";
 import {IRemoteNavFeedFactory} from "../src/interfaces/IRemoteNavFeedFactory.sol";
 import {ILayerZeroEndpointV2} from "@layerzerolabs/lz-evm-protocol-v2/contracts/interfaces/ILayerZeroEndpointV2.sol";
+import {SetConfigParam} from "@layerzerolabs/lz-evm-protocol-v2/contracts/interfaces/IMessageLibManager.sol";
 import {MockLayerZeroEndpoint} from "./mocks/CrosschainMocks.sol";
 
 /// @title RemoteNavFeedFactory.t.sol — the idempotent CREATE2 feed factory
@@ -30,10 +31,16 @@ contract RemoteNavFeedFactoryTest is Test {
     RemoteNavFeedFactory internal factory;
     address internal lens = makeAddr("lens");
     address internal vault = makeAddr("vault");
+    address internal readLibrary = makeAddr("read library");
 
     function setUp() public {
         endpoint = new MockLayerZeroEndpoint();
         factory = new RemoteNavFeedFactory(ILayerZeroEndpointV2(address(endpoint)));
+    }
+
+    function _readConfig() internal pure returns (SetConfigParam[] memory config) {
+        config = new SetConfigParam[](1);
+        config[0] = SetConfigParam({eid: READ_CHANNEL, configType: 1, config: hex"c0ffee"});
     }
 
     /// @dev Baseline params; individual tests mutate one field at a time.
@@ -46,6 +53,8 @@ contract RemoteNavFeedFactoryTest is Test {
             confirmations: CONFIRMATIONS,
             gasAllowance: GAS_ALLOWANCE,
             maxStaleness: MAX_STALENESS,
+            readLibrary: readLibrary,
+            readConfig: _readConfig(),
             description: DESCRIPTION
         });
     }
@@ -131,6 +140,44 @@ contract RemoteNavFeedFactoryTest is Test {
         assertEq(factory.feedsLength(), 2, "both recorded");
     }
 
+    // Regression: the LayerZero security configuration is part of the feed's
+    // identity, so checking the address checks the verifier set.
+    function test_deploy_differentReadLibrary_differentAddress() public {
+        address a = _deploy(SALT, MAX_STALENESS, DESCRIPTION);
+
+        IRemoteNavFeedFactory.FeedParams memory params = _params();
+        params.readLibrary = makeAddr("another read library");
+        address b = factory.deploy(params);
+
+        assertTrue(a != b, "read library is part of the identity");
+        assertEq(factory.feedsLength(), 2, "both recorded");
+    }
+
+    function test_deploy_differentReadConfig_differentAddress() public {
+        address a = _deploy(SALT, MAX_STALENESS, DESCRIPTION);
+
+        IRemoteNavFeedFactory.FeedParams memory params = _params();
+        params.readConfig[0].config = hex"decaf0";
+        address b = factory.deploy(params);
+
+        assertTrue(a != b, "verifier config is part of the identity");
+        assertEq(factory.feedsLength(), 2, "both recorded");
+    }
+
+    function test_deploy_zeroReadLibrary_reverts() public {
+        IRemoteNavFeedFactory.FeedParams memory params = _params();
+        params.readLibrary = address(0);
+        vm.expectRevert(IRemoteNavFeed.ZeroReadLibrary.selector);
+        factory.deploy(params);
+    }
+
+    function test_deploy_emptyReadConfig_reverts() public {
+        IRemoteNavFeedFactory.FeedParams memory params = _params();
+        params.readConfig = new SetConfigParam[](0);
+        vm.expectRevert(IRemoteNavFeed.EmptyReadConfig.selector);
+        factory.deploy(params);
+    }
+
     function test_deploy_gasAllowanceBelowFloor_reverts() public {
         IRemoteNavFeedFactory.FeedParams memory params = _params();
         params.gasAllowance = 59_999;
@@ -167,7 +214,16 @@ contract RemoteNavFeedFactoryTest is Test {
         assertEq(feed.CONFIRMATIONS(), CONFIRMATIONS, "confirmations");
         assertEq(feed.GAS_ALLOWANCE(), GAS_ALLOWANCE, "gas allowance");
         assertEq(feed.MAX_STALENESS(), MAX_STALENESS, "max staleness");
+        assertEq(feed.READ_LIBRARY(), readLibrary, "read library");
         assertEq(feed.description(), DESCRIPTION, "description");
+
+        // The feed configured itself on the endpoint and appointed nobody.
+        assertEq(endpoint.sendLibrary(feedAddr, READ_CHANNEL), readLibrary, "send library on the endpoint");
+        assertEq(endpoint.receiveLibrary(feedAddr, READ_CHANNEL), readLibrary, "receive library on the endpoint");
+        SetConfigParam[] memory applied = endpoint.config(feedAddr, readLibrary);
+        assertEq(applied.length, 1, "one config entry");
+        assertEq(applied[0].config, hex"c0ffee", "config bytes on the endpoint");
+        assertEq(endpoint.delegates(feedAddr), address(0), "no delegate on the endpoint");
     }
 
     // ── enumeration ─────────────────────────────────────────────────────────────

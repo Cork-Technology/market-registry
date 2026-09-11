@@ -2,6 +2,7 @@
 pragma solidity ^0.8.30;
 
 import {ILayerZeroEndpointV2} from "@layerzerolabs/lz-evm-protocol-v2/contracts/interfaces/ILayerZeroEndpointV2.sol";
+import {SetConfigParam} from "@layerzerolabs/lz-evm-protocol-v2/contracts/interfaces/IMessageLibManager.sol";
 
 /// @title IRemoteNavFeedFactory
 /// @notice The external surface of RemoteNavFeedFactory: deterministic deployment,
@@ -13,6 +14,15 @@ interface IRemoteNavFeedFactory {
     ///         CREATE2 address, so identical params (and salt) map to one address.
     ///         Put 100k gas as allowance when in doubt.
     /// @dev    Gas consumption for a round is measured at ~58k-60k.
+    ///
+    ///         `readLibrary` and `readConfig` are the feed's whole LayerZero
+    ///         security configuration. The feed applies them to the endpoint in
+    ///         its constructor and has no owner or delegate, so they can never
+    ///         change afterwards; a verifier going offline means deploying a new
+    ///         feed at a new address. Both are part of the feed's address, so
+    ///         checking the address checks the verifier set. `readConfig` is the
+    ///         library's own `SetConfigParam` list (for ReadLib1002: eid
+    ///         READ_CHANNEL, config type 1, an abi-encoded `ReadLibConfig`).
     struct FeedParams {
         bytes32 salt; // caller-chosen CREATE2 salt
         uint32 eid; // LayerZero endpoint id of the chain the vault lives on
@@ -20,7 +30,9 @@ interface IRemoteNavFeedFactory {
         address targetChainVault; // the ERC-4626 vault on that chain
         uint16 confirmations; // source-chain block confirmations the verifiers wait for
         uint128 gasAllowance; // executor gas allowance for delivering responses
-        uint256 maxStaleness; // the feed's staleness bound
+        uint256 maxStaleness; // the feed's staleness bound, at most MAX_STALENESS_CEILING
+        address readLibrary; // the LayerZero read library, set as send and receive library for READ_CHANNEL
+        SetConfigParam[] readConfig; // the verifier configuration applied to readLibrary
         string description; // the feed's Chainlink-style description
     }
 

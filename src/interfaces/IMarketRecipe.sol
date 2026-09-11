@@ -31,14 +31,14 @@ interface IMarketRecipe {
     /// @param ca The collateral asset.
     /// @param ref The reference asset.
     /// @param rateOracle The rate oracle for this market — an `IRateOracle`.
-    /// @param additionalData Recipe-specific input, opaque to the registry and to the adapter. Passed
+    /// @param extraData Recipe-specific input, opaque to the registry and to the adapter. Passed
     ///        through from the order payload verbatim so that `verify` can be handed the same bytes
     ///        `resolve` saw.
     /// @return constraint The four concrete rate limits, on the RATE scale (`1e18` = 1.0). If the
     ///         recipe holds percentage bands internally, `MarketRegistryLib.applyBands` is the one
     ///         place that conversion is allowed to happen — the percentage scale (`1e18` = 1%) and
     ///         the rate scale differ by a factor of 100.
-    function resolve(address ca, address ref, address rateOracle, bytes calldata additionalData)
+    function resolve(address ca, address ref, address rateOracle, bytes calldata extraData)
         external
         view
         returns (IMarketRegistry.ResolvedConstraint memory constraint);
@@ -53,14 +53,24 @@ interface IMarketRecipe {
     ///        `IRateOracle` to do so. A recipe that needs the rate and is handed `address(0)` cannot
     ///        answer and should REVERT rather than return `false` — see above on why those two are
     ///        different.
+    /// @param expiryTimestamp The market's expiry, unix seconds, as the order carries it. A recipe
+    ///        whose policy is sized by the market's life checks the order's claim against this.
+    /// @param creating True on the fill that creates the pool, false on every later fill into it.
+    ///        `verify` is stateless and runs on every fill, so a rule that must hold once, at
+    ///        creation, and must NOT be re-applied afterwards can only be told apart by this flag.
+    ///        The caller is the one party that knows whether the pool exists yet. The flag means
+    ///        "the pool does not exist yet", not "this recipe has not seen this pool yet": the recipe
+    ///        is not part of the pool id, so a pool another recipe created reads as an existing one.
     /// @param constraint The constraint the order carries, on the rate scale (`1e18` = 1.0).
-    /// @param additionalData The same recipe-specific bytes `resolve` was given, carried in the order.
+    /// @param extraData The same recipe-specific bytes `resolve` was given, carried in the order.
     /// @return True if the recipe accepts the constraint for this pair at this moment.
     function verify(
         address ca,
         address ref,
         address rateOracle,
+        uint256 expiryTimestamp,
+        bool creating,
         IMarketRegistry.ResolvedConstraint calldata constraint,
-        bytes calldata additionalData
+        bytes calldata extraData
     ) external view returns (bool);
 }

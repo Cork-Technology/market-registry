@@ -5,8 +5,8 @@ import {Test} from "forge-std/Test.sol";
 import {IMarketRegistry} from "../../src/interfaces/IMarketRegistry.sol";
 import {RegistryHandler} from "./handlers/RegistryHandler.sol";
 
-/// @title StoreInvariants — handler-based invariant suite for MarketRegistry (T-write-tests-06).
-/// @notice Asserts the store-integrity invariants from Build Spec §13 under an arbitrary interleaving
+/// @title StoreInvariants — handler-based invariant suite for MarketRegistry.
+/// @notice Asserts the store-integrity invariants under an arbitrary interleaving
 ///         of adds, removes, batches, source mutations, and deploys driven by {RegistryHandler}:
 ///
 ///           INV-I-01  existence iff index != 0, and value-1 == enumeration-array position (asset + feed stores)
@@ -18,7 +18,7 @@ import {RegistryHandler} from "./handlers/RegistryHandler.sol";
 ///
 ///         OBSERVATION HOOKS: the two `get*` enumerations, the `lookup*` views, and `lookupWrapper`
 ///         are the oracles; enumeration index maps are read directly with `vm.load`. Wrappers are no
-///         longer enumerated — they are keyed by pair AND resolved sources and read one at a time.
+///         longer enumerated — they are keyed by pair, mode AND wiring and read one at a time.
 ///
 /// @dev ## INV-I-04 WAS RESTATED, NOT MERELY RE-POINTED — read this before touching it
 ///
@@ -152,8 +152,8 @@ contract StoreInvariantsTest is Test {
     // INV-I-04 — a source's denomination matches its PRESENCE, both ways
     // ═════════════════════════════════════════════════════════════════════════════
 
-    /// @notice Every PRESENT source carries a non-empty denomination; every ABSENT source carries the
-    ///         empty string.
+    /// @notice Every PRESENT source carries a non-zero denomination unit; every ABSENT source carries
+    ///         the zero address.
     /// @dev Replaces the predecessor's "every stored asset carries a non-empty denomination". See the
     ///      contract-level note for why that statement is no longer true — in short, the asset-level
     ///      field is gone and a sourceless asset is a legal entry with no denomination anywhere.
@@ -177,14 +177,11 @@ contract StoreInvariantsTest is Test {
     function _assertDenominationMatchesPresence(IMarketRegistry.AssetSource memory s, string memory tag) internal view {
         if (s.addr == address(0)) {
             assertEq(
-                bytes(s.denomination).length,
-                0,
-                string.concat("INV-I-04 ", tag, ": an absent source carries a denomination")
+                s.denomination, address(0), string.concat("INV-I-04 ", tag, ": an absent source carries a denomination")
             );
         } else {
-            assertGt(
-                bytes(s.denomination).length,
-                0,
+            assertTrue(
+                s.denomination != address(0),
                 string.concat("INV-I-04 ", tag, ": a present source carries no denomination")
             );
         }
@@ -195,7 +192,7 @@ contract StoreInvariantsTest is Test {
     // ═════════════════════════════════════════════════════════════════════════════
 
     /// @dev The MODE is part of the question now. A pair can hold a NAV wrapper and a price wrapper at
-    ///      the same time (the wrapper key includes both resolved source addresses), so a two-argument
+    ///      the same time (the wrapper key includes the mode and both legs' wiring), so a two-argument
     ///      lookup could no longer name one wrapper.
     function invariant_W01_pairLookupMatchesRecorded() public view {
         uint256 n = handler.pairCount();

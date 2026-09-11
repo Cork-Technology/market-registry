@@ -7,12 +7,13 @@ pragma solidity ^0.8.30;
 ///         `asset()` (selector 0x38d52e0f) behave in one specific way so that
 ///         `MarketRegistryLib.probeAsset` is forced down each branch of its acceptance rule.
 ///
-///         ## The probe changed shape, and so did this file (#82)
+///         ## The probe changed shape, and so did this file
 ///
 ///         The predecessor probe was an inline-assembly `staticcall` with a 50,000-gas cap and a
 ///         32-byte returndata cap: it classified EVERY hostile return shape as a leaf and could never
 ///         revert. `probeAsset` is now a plain `try IWrapper(target).asset()`, which is a deliberate
-///         reversal (validation finding S2). Three consequences shape the mocks below:
+///         reversal, so the mocks here exercise both what the new probe catches and what it
+///         bubbles. Three consequences shape the mocks below:
 ///
 ///         1. A revert, and a target with NO `asset()` at all, are still caught → leaf.
 ///         2. MALFORMED return data — fewer than 32 bytes, no data at all, or a word whose upper 96

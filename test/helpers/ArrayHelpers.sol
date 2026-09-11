@@ -30,9 +30,3 @@ function one(address addr) pure returns (address[] memory a) {
     a = new address[](1);
     a[0] = addr;
 }
-
-/// @notice A one-element `string` array — denomination labels.
-function one(string memory s) pure returns (string[] memory a) {
-    a = new string[](1);
-    a[0] = s;
-}

@@ -22,7 +22,7 @@ contract LiquidityNavRecipe is BaseLiquidityRecipe, IVersion {
     }
 
     /// @inheritdoc BaseLiquidityRecipe
-    /// @dev `NAV` sends the adapter's step 3 to `registry.deploy(ca, ref, OracleMode.NAV)`, which
+    /// @dev `NAV` sends the adapter's step 3 to `registry.deploy(ca, ref, OracleMode.NAV, oracleSalt)`, which
     ///      requires at least one leg of the pair to carry a NAV source. The oracle it returns is the
     ///      one the base contract's `resolve` and `verify` read.
     function _source() internal pure override returns (RecipeSource) {

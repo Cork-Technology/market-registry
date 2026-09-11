@@ -93,7 +93,14 @@ contract ApySpreadImpairmentRecipeTest is RegistryFixture {
         if (oracle.code.length == 0) oracle = reg.deployFixedRateOracle(rate);
     }
 
-    /// @dev The recipe's `additionalData`: three ABI words, in the contract's documented order.
+    /// @dev An expiry a full registry bound away, so every duration this suite declares fits inside
+    ///      the market's life. Tests about the life rule itself build their own expiry.
+    function _expiry() internal view returns (uint256) {
+        return block.timestamp + MAX_EXPIRY;
+    }
+
+    /// @dev The recipe's `extraData`, built by hand so the tests below can pin that the recipe's
+    ///      own `encodeExtraData` agrees with it (see {test_apySpread_encodeExtraData_isAbiEncode}).
     function _data(uint256 anchor, uint256 duration, uint256 spread) internal pure returns (bytes memory) {
         return abi.encode(anchor, duration, spread);
     }
@@ -190,6 +197,53 @@ contract ApySpreadImpairmentRecipeTest is RegistryFixture {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
+    // 1b. The payload helpers
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// @notice `encodeExtraData` and `decodeExtraData` agree on every value.
+    function testFuzz_apySpread_extraData_roundTrips(uint256 anchor, uint256 duration, uint256 spread) public view {
+        bytes memory data = recipe.encodeExtraData(anchor, duration, spread);
+        assertEq(data.length, recipe.EXTRA_DATA_LENGTH(), "three words");
+
+        (uint256 gotAnchor, uint256 gotDuration, uint256 gotSpread) = recipe.decodeExtraData(data);
+        assertEq(gotAnchor, anchor, "anchor");
+        assertEq(gotDuration, duration, "duration");
+        assertEq(gotSpread, spread, "spread");
+    }
+
+    /// @notice The helper is plain `abi.encode` of the three words, in that order, so a caller that
+    ///         encodes by hand and one that asks the recipe produce byte-identical payloads.
+    function test_apySpread_encodeExtraData_isAbiEncode() public view {
+        assertEq(recipe.encodeExtraData(ONE, YEAR, 10 * PCT), abi.encode(ONE, YEAR, 10 * PCT), "typical values");
+        assertEq(recipe.encodeExtraData(0, 0, 0), abi.encode(uint256(0), uint256(0), uint256(0)), "zeros");
+        assertEq(
+            recipe.encodeExtraData(type(uint256).max, 1, 2),
+            abi.encode(type(uint256).max, uint256(1), uint256(2)),
+            "extremes"
+        );
+        assertEq(recipe.encodeExtraData(ONE, YEAR, 10 * PCT), _data(ONE, YEAR, 10 * PCT), "the suite's own helper");
+    }
+
+    /// @notice `decodeExtraData` refuses what `resolve` refuses, with the same error, so a caller
+    ///         checking a payload off-chain sees exactly the rejection `resolve` would give.
+    function test_apySpread_decodeExtraData_malformed_revertsLikeResolve() public {
+        vm.expectRevert(abi.encodeWithSelector(ApySpreadImpairmentRecipe.MalformedExtraData.selector, 0));
+        recipe.decodeExtraData("");
+
+        vm.expectRevert(abi.encodeWithSelector(ApySpreadImpairmentRecipe.MalformedExtraData.selector, 32));
+        recipe.decodeExtraData(abi.encode(ONE));
+
+        vm.expectRevert(abi.encodeWithSelector(ApySpreadImpairmentRecipe.MalformedExtraData.selector, 64));
+        recipe.decodeExtraData(abi.encode(ONE, YEAR));
+
+        vm.expectRevert(abi.encodeWithSelector(ApySpreadImpairmentRecipe.MalformedExtraData.selector, 128));
+        recipe.decodeExtraData(abi.encode(ONE, YEAR, 10 * PCT, ONE));
+
+        vm.expectRevert(abi.encodeWithSelector(ApySpreadImpairmentRecipe.MalformedExtraData.selector, 3));
+        recipe.decodeExtraData(hex"c0ffee");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
     // 2. resolve — the happy paths
     // ═══════════════════════════════════════════════════════════════════════════
 
@@ -215,12 +269,13 @@ contract ApySpreadImpairmentRecipeTest is RegistryFixture {
 
     /// @notice The fallback exists for one case: the FIRST order ever written against a pair, signed
     ///         before the adapter's step 3 has deployed the feed wrapper. There is no oracle to read
-    ///         then, so the anchor travels in `additionalData` instead.
+    ///         then, so the anchor travels in `extraData` instead.
     function test_apySpread_resolve_fallsBackToTheCarriedAnchorWhenNoOracle() public view {
         uint256 anchor = 2 * ONE;
         uint256 spread = 10 * PCT;
 
-        IMarketRegistry.ResolvedConstraint memory c = recipe.resolve(ca, ref, address(0), _data(anchor, YEAR, spread));
+        IMarketRegistry.ResolvedConstraint memory c =
+            recipe.resolve(ca, ref, address(0), recipe.encodeExtraData(anchor, YEAR, spread));
 
         assertEq(c.rateMin, 1.8e18, "floor is 10% below the CARRIED anchor");
         assertEq(c.rateMax, 2.2e18, "ceiling is 10% above it");
@@ -270,26 +325,32 @@ contract ApySpreadImpairmentRecipeTest is RegistryFixture {
         assertEq(half.rateChangeCapacityMax, year.rateChangeCapacityMax, "and neither does the capacity");
     }
 
-    /// @notice THERE IS NO WHITELIST OF SPREADS, and this is the regression guard on that. An earlier
-    ///         draft restricted the spread to a fixed set of buckets; that policy was removed
-    ///         deliberately, so a 60% spread — and a 99% one — must resolve like any other. The only
-    ///         bound left is the derived band reaching 100%, tested separately.
-    function test_apySpread_resolve_acceptsAnySpreadIncludingLargeOnes() public view {
-        uint256[4] memory spreads = [uint256(1 * PCT), 10 * PCT, 60 * PCT, 99 * PCT];
+    /// @notice THERE IS NO WHITELIST OF SPREADS, only a ceiling. An earlier draft restricted the
+    ///         spread to a fixed set of buckets; that policy stays removed, so any spread up to and
+    ///         including {ApySpreadImpairmentRecipe.MAX_APY_SPREAD_PERCENTAGE} resolves like any
+    ///         other as long as the band it produces fits under
+    ///         {ApySpreadImpairmentRecipe.MAX_BAND_PERCENTAGE}. Over half a year the band is half the
+    ///         spread, so the whole permitted range fits. The predecessor of this test guarded the
+    ///         absence of any ceiling; that decision is reversed on purpose, see
+    ///         {test_apySpread_resolve_spreadTooHigh_revertsAndTheBoundaryHolds}.
+    function test_apySpread_resolve_acceptsAnySpreadUnderTheCapWhenTheBandFits() public view {
+        uint256 cap = recipe.MAX_APY_SPREAD_PERCENTAGE();
+        assertEq(cap, 100 * PCT, "the ceiling is 100% a year");
+        uint256[5] memory spreads = [uint256(1 * PCT), 10 * PCT, 60 * PCT, 99 * PCT, cap];
 
         for (uint256 i = 0; i < spreads.length; ++i) {
             IMarketRegistry.ResolvedConstraint memory c =
-                recipe.resolve(ca, ref, address(0), _data(ONE, YEAR, spreads[i]));
-            _assertConstraintEq(c, _expected(ONE, YEAR, spreads[i]), "no bucket policy stands in the way");
+                recipe.resolve(ca, ref, address(0), _data(ONE, YEAR / 2, spreads[i]));
+            _assertConstraintEq(c, _expected(ONE, YEAR / 2, spreads[i]), "no bucket policy stands in the way");
             assertGt(c.rateMin, 0, "phoenix's rateMin > 0");
             assertLt(c.rateMin, c.rateMax, "phoenix's STRICT rateMin < rateMax");
         }
 
-        // The 60% case in full, because it is the one the removed policy would have refused.
+        // The 60% case in full, because it is the one the removed bucket policy would have refused.
         IMarketRegistry.ResolvedConstraint memory sixty =
-            recipe.resolve(ca, ref, address(0), _data(ONE, YEAR, 60 * PCT));
-        assertEq(sixty.rateMin, 0.4e18, "a 60% spread over a year puts the floor at 0.4");
-        assertEq(sixty.rateMax, 1.6e18, "and the ceiling at 1.6");
+            recipe.resolve(ca, ref, address(0), _data(ONE, YEAR / 2, 60 * PCT));
+        assertEq(sixty.rateMin, 0.7e18, "a 60% spread over half a year puts the floor at 0.7");
+        assertEq(sixty.rateMax, 1.3e18, "and the ceiling at 1.3");
     }
 
     /// @notice The recipe holds no state about a market, so the same instance answers for any pair and
@@ -305,32 +366,32 @@ contract ApySpreadImpairmentRecipeTest is RegistryFixture {
     // 3. resolve — the rejections
     // ═══════════════════════════════════════════════════════════════════════════
 
-    /// @notice `additionalData` is exactly three words. Anything else is an order built against a
+    /// @notice `extraData` is exactly three words. Anything else is an order built against a
     ///         different recipe, and guessing at it is how a market gets created with the wrong
     ///         numbers.
-    function test_apySpread_resolve_malformedAdditionalData_reverts() public {
-        vm.expectRevert(abi.encodeWithSelector(ApySpreadImpairmentRecipe.MalformedAdditionalData.selector, 0));
+    function test_apySpread_resolve_malformedExtraData_reverts() public {
+        vm.expectRevert(abi.encodeWithSelector(ApySpreadImpairmentRecipe.MalformedExtraData.selector, 0));
         recipe.resolve(ca, ref, address(0), "");
 
         bytes memory oneWord = abi.encode(ONE);
-        vm.expectRevert(abi.encodeWithSelector(ApySpreadImpairmentRecipe.MalformedAdditionalData.selector, 32));
+        vm.expectRevert(abi.encodeWithSelector(ApySpreadImpairmentRecipe.MalformedExtraData.selector, 32));
         recipe.resolve(ca, ref, address(0), oneWord);
 
         bytes memory twoWords = abi.encode(ONE, YEAR);
-        vm.expectRevert(abi.encodeWithSelector(ApySpreadImpairmentRecipe.MalformedAdditionalData.selector, 64));
+        vm.expectRevert(abi.encodeWithSelector(ApySpreadImpairmentRecipe.MalformedExtraData.selector, 64));
         recipe.resolve(ca, ref, address(0), twoWords);
 
         bytes memory fourWords = abi.encode(ONE, YEAR, 10 * PCT, ONE);
-        vm.expectRevert(abi.encodeWithSelector(ApySpreadImpairmentRecipe.MalformedAdditionalData.selector, 128));
+        vm.expectRevert(abi.encodeWithSelector(ApySpreadImpairmentRecipe.MalformedExtraData.selector, 128));
         recipe.resolve(ca, ref, address(0), fourWords);
     }
 
     /// @notice The length check comes BEFORE the oracle is read, so a live oracle does not excuse a
     ///         malformed payload — unlike the liquidity recipes, this one needs the payload's other two
     ///         words whatever the anchor's provenance.
-    function test_apySpread_resolve_malformedAdditionalData_revertsEvenWithALiveOracle() public {
+    function test_apySpread_resolve_malformedExtraData_revertsEvenWithALiveOracle() public {
         address oracle = _oracleAt(ONE);
-        vm.expectRevert(abi.encodeWithSelector(ApySpreadImpairmentRecipe.MalformedAdditionalData.selector, 0));
+        vm.expectRevert(abi.encodeWithSelector(ApySpreadImpairmentRecipe.MalformedExtraData.selector, 0));
         recipe.resolve(ca, ref, oracle, "");
     }
 
@@ -383,20 +444,54 @@ contract ApySpreadImpairmentRecipeTest is RegistryFixture {
         recipe.resolve(ca, ref, address(0), _data(ONE, duration, 10 * PCT));
     }
 
-    /// @notice At a band of 100% the floor lands on zero and beyond it there is no creatable market,
-    ///         so the check is `>=`. Over a full year the band IS the spread, which makes the boundary
-    ///         exact: a 100% spread is refused and a 100%-minus-one-wei spread is not.
+    /// @notice The band is capped at 50%, which keeps the floor at no less than half the anchor. The
+    ///         predecessor of this rule only refused a band at or past 100%, where the floor lands on
+    ///         zero. Over a full year the band IS the spread, which makes the boundary exact: a 50%
+    ///         spread is allowed and a 50%-plus-one-wei spread is refused, with the error naming both
+    ///         the band and the cap.
     function test_apySpread_resolve_bandTooWide_revertsAndTheBoundaryHolds() public {
-        vm.expectRevert(abi.encodeWithSelector(ApySpreadImpairmentRecipe.BandTooWide.selector, HUNDRED_PCT));
+        uint256 cap = recipe.MAX_BAND_PERCENTAGE();
+        assertEq(cap, 50 * PCT, "the band ceiling is 50%");
+
+        vm.expectRevert(abi.encodeWithSelector(ApySpreadImpairmentRecipe.BandTooWide.selector, cap + 1, cap));
+        recipe.resolve(ca, ref, address(0), _data(ONE, YEAR, cap + 1));
+
+        // The spread ceiling itself, over a full year: a band of 100%.
+        vm.expectRevert(abi.encodeWithSelector(ApySpreadImpairmentRecipe.BandTooWide.selector, HUNDRED_PCT, cap));
         recipe.resolve(ca, ref, address(0), _data(ONE, YEAR, HUNDRED_PCT));
 
-        vm.expectRevert(abi.encodeWithSelector(ApySpreadImpairmentRecipe.BandTooWide.selector, 500e18));
-        recipe.resolve(ca, ref, address(0), _data(ONE, YEAR, 500 * PCT));
+        IMarketRegistry.ResolvedConstraint memory c = recipe.resolve(ca, ref, address(0), _data(ONE, YEAR, cap));
+        _assertConstraintEq(c, _expected(ONE, YEAR, cap), "exactly at the cap still resolves");
+        assertEq(c.rateMin, 0.5e18, "and the floor is half the anchor");
+        assertEq(c.rateMax, 1.5e18, "with the ceiling mirrored above it");
+    }
 
-        IMarketRegistry.ResolvedConstraint memory c =
-            recipe.resolve(ca, ref, address(0), _data(ONE, YEAR, HUNDRED_PCT - 1));
-        _assertConstraintEq(c, _expected(ONE, YEAR, HUNDRED_PCT - 1), "one wei under the bound still resolves");
-        assertGt(c.rateMin, 0, "and the floor is still above zero");
+    /// @notice THE SPREAD IS BOUNDED ON ITS OWN, not only through the band. The band is the product
+    ///         of the spread and the life, so with the spread free an author could trade a short life
+    ///         for a huge spread and land on the same window. The ceiling is 100% a year, inclusive:
+    ///         100% over half a year is a 50% band and resolves; one wei more is refused before the
+    ///         band is even computed, so the error names the spread and the cap.
+    function test_apySpread_resolve_spreadTooHigh_revertsAndTheBoundaryHolds() public {
+        uint256 cap = recipe.MAX_APY_SPREAD_PERCENTAGE();
+
+        vm.expectRevert(abi.encodeWithSelector(ApySpreadImpairmentRecipe.SpreadTooHigh.selector, cap + 1, cap));
+        recipe.resolve(ca, ref, address(0), _data(ONE, YEAR / 2, cap + 1));
+
+        // A short life does not rescue an oversized spread: the band would be tiny, and it is still refused.
+        vm.expectRevert(abi.encodeWithSelector(ApySpreadImpairmentRecipe.SpreadTooHigh.selector, 500 * PCT, cap));
+        recipe.resolve(ca, ref, address(0), _data(ONE, 1 days, 500 * PCT));
+
+        IMarketRegistry.ResolvedConstraint memory c = recipe.resolve(ca, ref, address(0), _data(ONE, YEAR / 2, cap));
+        _assertConstraintEq(c, _expected(ONE, YEAR / 2, cap), "exactly at the cap still resolves");
+        assertEq(c.rateMin, 0.5e18, "100% a year over half a year is a 50% band");
+    }
+
+    /// @notice The rules are checked in a fixed order and the spread ceiling comes before the band
+    ///         ceiling, so an author who breaks both is told about the spread.
+    function test_apySpread_resolve_spreadTooHigh_isReportedBeforeBandTooWide() public {
+        uint256 cap = recipe.MAX_APY_SPREAD_PERCENTAGE();
+        vm.expectRevert(abi.encodeWithSelector(ApySpreadImpairmentRecipe.SpreadTooHigh.selector, 2 * cap, cap));
+        recipe.resolve(ca, ref, address(0), _data(ONE, YEAR, 2 * cap));
     }
 
     /// @notice `WindowCollapsed` IS reachable, and this is the shape that reaches it: a dust anchor.
@@ -432,27 +527,29 @@ contract ApySpreadImpairmentRecipeTest is RegistryFixture {
     // ═══════════════════════════════════════════════════════════════════════════
 
     function test_apySpread_verify_acceptsItsOwnResolveOutput() public {
-        bytes memory data = _data(0, YEAR, 10 * PCT);
+        bytes memory data = recipe.encodeExtraData(0, YEAR, 10 * PCT);
         address oracle = _oracleAt(ONE);
 
         IMarketRegistry.ResolvedConstraint memory c = recipe.resolve(ca, ref, oracle, data);
-        assertTrue(recipe.verify(ca, ref, oracle, c, data), "resolve's own output must verify");
+        assertTrue(recipe.verify(ca, ref, oracle, _expiry(), true, c, data), "resolve's own output must verify");
     }
 
     /// @notice `verify` returns FALSE for a payload it cannot use, where `resolve` REVERTS. The
     ///         asymmetry is the interface's rule, not an inconsistency: `resolve` is called off-chain
     ///         by the agent building the order, so a loud failure is a bug report at the moment the
     ///         mistake is made; `verify` runs on-chain and the adapter owns the revert selector.
-    function test_apySpread_verify_malformedAdditionalData_returnsFalse() public {
+    function test_apySpread_verify_malformedExtraData_returnsFalse() public {
         bytes memory data = _data(0, YEAR, 10 * PCT);
         address oracle = _oracleAt(ONE);
         IMarketRegistry.ResolvedConstraint memory c = recipe.resolve(ca, ref, oracle, data);
 
-        assertFalse(recipe.verify(ca, ref, oracle, c, ""), "empty");
-        assertFalse(recipe.verify(ca, ref, oracle, c, abi.encode(ONE)), "one word");
-        assertFalse(recipe.verify(ca, ref, oracle, c, abi.encode(ONE, YEAR)), "two words");
-        assertFalse(recipe.verify(ca, ref, oracle, c, abi.encode(ONE, YEAR, 10 * PCT, ONE)), "four words");
-        assertFalse(recipe.verify(ca, ref, oracle, c, hex"c0ffee"), "not a word at all");
+        assertFalse(recipe.verify(ca, ref, oracle, _expiry(), true, c, ""), "empty");
+        assertFalse(recipe.verify(ca, ref, oracle, _expiry(), true, c, abi.encode(ONE)), "one word");
+        assertFalse(recipe.verify(ca, ref, oracle, _expiry(), true, c, abi.encode(ONE, YEAR)), "two words");
+        assertFalse(
+            recipe.verify(ca, ref, oracle, _expiry(), true, c, abi.encode(ONE, YEAR, 10 * PCT, ONE)), "four words"
+        );
+        assertFalse(recipe.verify(ca, ref, oracle, _expiry(), true, c, hex"c0ffee"), "not a word at all");
     }
 
     /// @notice The shape is checked on all FOUR fields, so tampering with any one of them is refused
@@ -461,7 +558,9 @@ contract ApySpreadImpairmentRecipeTest is RegistryFixture {
         bytes memory data = _data(0, YEAR, 10 * PCT);
         address oracle = _oracleAt(ONE);
         IMarketRegistry.ResolvedConstraint memory c = recipe.resolve(ca, ref, oracle, data);
-        assertTrue(recipe.verify(ca, ref, oracle, c, data), "precondition: the untouched constraint verifies");
+        assertTrue(
+            recipe.verify(ca, ref, oracle, _expiry(), true, c, data), "precondition: the untouched constraint verifies"
+        );
 
         // The window fields move the recovered midpoint too, so each is nudged by two wei on one side
         // only — enough to break the shape without any chance of the rounding absorbing it.
@@ -470,6 +569,8 @@ contract ApySpreadImpairmentRecipeTest is RegistryFixture {
                 ca,
                 ref,
                 oracle,
+                _expiry(),
+                true,
                 _constraint(c.rateMin - 2, c.rateMax, c.rateChangePerDayMax, c.rateChangeCapacityMax),
                 data
             ),
@@ -480,6 +581,8 @@ contract ApySpreadImpairmentRecipeTest is RegistryFixture {
                 ca,
                 ref,
                 oracle,
+                _expiry(),
+                true,
                 _constraint(c.rateMin, c.rateMax + 2, c.rateChangePerDayMax, c.rateChangeCapacityMax),
                 data
             ),
@@ -490,6 +593,8 @@ contract ApySpreadImpairmentRecipeTest is RegistryFixture {
                 ca,
                 ref,
                 oracle,
+                _expiry(),
+                true,
                 _constraint(c.rateMin, c.rateMax, c.rateChangePerDayMax + 1, c.rateChangeCapacityMax),
                 data
             ),
@@ -500,6 +605,8 @@ contract ApySpreadImpairmentRecipeTest is RegistryFixture {
                 ca,
                 ref,
                 oracle,
+                _expiry(),
+                true,
                 _constraint(c.rateMin, c.rateMax, c.rateChangePerDayMax, c.rateChangeCapacityMax + 1),
                 data
             ),
@@ -514,9 +621,14 @@ contract ApySpreadImpairmentRecipeTest is RegistryFixture {
         address oracle = _oracleAt(ONE);
         IMarketRegistry.ResolvedConstraint memory c = recipe.resolve(ca, ref, oracle, _data(0, YEAR, 10 * PCT));
 
-        assertFalse(recipe.verify(ca, ref, oracle, c, _data(0, YEAR / 2, 10 * PCT)), "a different duration");
-        assertFalse(recipe.verify(ca, ref, oracle, c, _data(0, YEAR, 20 * PCT)), "a different spread");
-        assertTrue(recipe.verify(ca, ref, oracle, c, _data(0, YEAR, 10 * PCT)), "and the matching pair still passes");
+        assertFalse(
+            recipe.verify(ca, ref, oracle, _expiry(), true, c, _data(0, YEAR / 2, 10 * PCT)), "a different duration"
+        );
+        assertFalse(recipe.verify(ca, ref, oracle, _expiry(), true, c, _data(0, YEAR, 20 * PCT)), "a different spread");
+        assertTrue(
+            recipe.verify(ca, ref, oracle, _expiry(), true, c, _data(0, YEAR, 10 * PCT)),
+            "and the matching pair still passes"
+        );
     }
 
     /// @notice The carried anchor is NOT trusted and NOT read: `verify` recovers the anchor from the
@@ -525,9 +637,13 @@ contract ApySpreadImpairmentRecipeTest is RegistryFixture {
         address oracle = _oracleAt(ONE);
         IMarketRegistry.ResolvedConstraint memory c = recipe.resolve(ca, ref, oracle, _data(0, YEAR, 10 * PCT));
 
-        assertTrue(recipe.verify(ca, ref, oracle, c, _data(0, YEAR, 10 * PCT)), "a zero anchor");
-        assertTrue(recipe.verify(ca, ref, oracle, c, _data(ONE, YEAR, 10 * PCT)), "the anchor it was built at");
-        assertTrue(recipe.verify(ca, ref, oracle, c, _data(1000 * ONE, YEAR, 10 * PCT)), "one it was not");
+        assertTrue(recipe.verify(ca, ref, oracle, _expiry(), true, c, _data(0, YEAR, 10 * PCT)), "a zero anchor");
+        assertTrue(
+            recipe.verify(ca, ref, oracle, _expiry(), true, c, _data(ONE, YEAR, 10 * PCT)), "the anchor it was built at"
+        );
+        assertTrue(
+            recipe.verify(ca, ref, oracle, _expiry(), true, c, _data(1000 * ONE, YEAR, 10 * PCT)), "one it was not"
+        );
     }
 
     /// @notice THE MIDPOINT IS THE ANCHOR, and this is what that buys. Both halves below are
@@ -539,13 +655,18 @@ contract ApySpreadImpairmentRecipeTest is RegistryFixture {
         IMarketRegistry.ResolvedConstraint memory low = recipe.resolve(ca, ref, _oracleAt(ONE), data);
         IMarketRegistry.ResolvedConstraint memory high = recipe.resolve(ca, ref, _oracleAt(2 * ONE), data);
 
-        assertTrue(recipe.verify(ca, ref, _oracleAt(ONE), low, data), "the 1.0 constraint alone verifies");
-        assertTrue(recipe.verify(ca, ref, _oracleAt(2 * ONE), high, data), "the 2.0 constraint alone verifies");
+        assertTrue(
+            recipe.verify(ca, ref, _oracleAt(ONE), _expiry(), true, low, data), "the 1.0 constraint alone verifies"
+        );
+        assertTrue(
+            recipe.verify(ca, ref, _oracleAt(2 * ONE), _expiry(), true, high, data), "the 2.0 constraint alone verifies"
+        );
 
         IMarketRegistry.ResolvedConstraint memory mixed =
             _constraint(high.rateMin, high.rateMax, low.rateChangePerDayMax, low.rateChangeCapacityMax);
         assertFalse(
-            recipe.verify(ca, ref, _oracleAt(2 * ONE), mixed, data), "the 2.0 window with the 1.0 allowances does not"
+            recipe.verify(ca, ref, _oracleAt(2 * ONE), _expiry(), true, mixed, data),
+            "the 2.0 window with the 1.0 allowances does not"
         );
     }
 
@@ -555,22 +676,42 @@ contract ApySpreadImpairmentRecipeTest is RegistryFixture {
         bytes memory data = _data(0, YEAR, 10 * PCT);
         address oracle = _oracleAt(ONE);
 
-        assertFalse(recipe.verify(ca, ref, oracle, _constraint(2 * ONE, ONE, 0, 0), data), "inverted window");
-        assertFalse(recipe.verify(ca, ref, oracle, _constraint(0, 0, 0, 0), data), "a zero-anchor window");
-        assertFalse(recipe.verify(ca, ref, oracle, _constraint(ONE, ONE, 0, 0), data), "single-point window");
+        assertFalse(
+            recipe.verify(ca, ref, oracle, _expiry(), true, _constraint(2 * ONE, ONE, 0, 0), data), "inverted window"
+        );
+        assertFalse(
+            recipe.verify(ca, ref, oracle, _expiry(), true, _constraint(0, 0, 0, 0), data), "a zero-anchor window"
+        );
+        assertFalse(
+            recipe.verify(ca, ref, oracle, _expiry(), true, _constraint(ONE, ONE, 0, 0), data), "single-point window"
+        );
     }
 
-    /// @notice A market that outlives the registry's creation bound is refused at verify time too, so
-    ///         lowering the bound stops the resting orders that were signed under the old one.
-    function test_apySpread_verify_rejectsADurationOverTheRegistryBound() public {
+    /// @notice THE REGISTRY BOUND IS A CREATION-TIME RULE, AND `verify` DOES NOT APPLY IT. The adapter
+    ///         checks `maxExpiryDuration` once, on the fill that creates the pool, and deliberately not
+    ///         afterwards: a market is permanent, so re-checking would only strand the honest orders
+    ///         already resting against it. The constraint is part of the pool id, so a stranded order
+    ///         cannot even be re-signed under the new bound without pointing at a different market.
+    ///         `verify` therefore reads nothing from the registry; `resolve`, the order-building path,
+    ///         still rejects loudly (see {test_apySpread_resolve_durationBoundFollowsTheRegistry}).
+    function test_apySpread_verify_ignoresTheRegistryBound() public {
         address oracle = _oracleAt(ONE);
         IMarketRegistry.ResolvedConstraint memory c = recipe.resolve(ca, ref, oracle, _data(0, YEAR, 10 * PCT));
-        assertTrue(recipe.verify(ca, ref, oracle, c, _data(0, YEAR, 10 * PCT)), "precondition");
+        assertTrue(recipe.verify(ca, ref, oracle, _expiry(), true, c, _data(0, YEAR, 10 * PCT)), "precondition");
 
         vm.prank(owner);
         reg.setMaxExpiryDuration(30 days);
+        assertLt(iReg.maxExpiryDuration(), YEAR, "fixture precondition: the carried duration now exceeds the bound");
 
-        assertFalse(recipe.verify(ca, ref, oracle, c, _data(0, YEAR, 10 * PCT)), "the same order stops filling");
+        assertTrue(
+            recipe.verify(ca, ref, oracle, _expiry(), true, c, _data(0, YEAR, 10 * PCT)), "the same order keeps filling"
+        );
+
+        // Control: the order-building path is where the tightened bound bites.
+        vm.expectRevert(
+            abi.encodeWithSelector(ApySpreadImpairmentRecipe.DurationTooLong.selector, YEAR, uint256(30 days))
+        );
+        recipe.resolve(ca, ref, oracle, _data(0, YEAR, 10 * PCT));
     }
 
     /// @notice The interface's rule about reverting: `false` means "this constraint is unacceptable",
@@ -583,7 +724,7 @@ contract ApySpreadImpairmentRecipeTest is RegistryFixture {
         IMarketRegistry.ResolvedConstraint memory c = recipe.resolve(ca, ref, address(0), _data(ONE, YEAR, 10 * PCT));
 
         vm.expectRevert(abi.encodeWithSelector(ApySpreadImpairmentRecipe.RateOracleNotDeployed.selector, ca, ref));
-        recipe.verify(ca, ref, address(0), c, _data(ONE, YEAR, 10 * PCT));
+        recipe.verify(ca, ref, address(0), _expiry(), true, c, _data(ONE, YEAR, 10 * PCT));
     }
 
     /// @notice The malformed-payload check runs BEFORE the missing-oracle revert, so a caller who gets
@@ -591,7 +732,7 @@ contract ApySpreadImpairmentRecipeTest is RegistryFixture {
     ///         order of those two lines is the difference between a verdict and a revert.
     function test_apySpread_verify_malformedPayloadWinsOverTheMissingOracle() public view {
         IMarketRegistry.ResolvedConstraint memory c = recipe.resolve(ca, ref, address(0), _data(ONE, YEAR, 10 * PCT));
-        assertFalse(recipe.verify(ca, ref, address(0), c, ""), "length first, oracle second");
+        assertFalse(recipe.verify(ca, ref, address(0), _expiry(), true, c, ""), "length first, oracle second");
     }
 
     /// @notice THE LIVE RATE MUST SIT STRICTLY INSIDE THE WINDOW, at both ends. This is what makes the
@@ -603,19 +744,147 @@ contract ApySpreadImpairmentRecipeTest is RegistryFixture {
         assertEq(c.rateMin, 0.9e18, "precondition: the window is [0.9, 1.1]");
         assertEq(c.rateMax, 1.1e18, "precondition: the window is [0.9, 1.1]");
 
-        assertTrue(recipe.verify(ca, ref, _oracleAt(c.rateMin + 1), c, data), "one wei above the floor");
-        assertTrue(recipe.verify(ca, ref, _oracleAt(ONE), c, data), "at the anchor");
-        assertTrue(recipe.verify(ca, ref, _oracleAt(c.rateMax - 1), c, data), "one wei below the ceiling");
+        assertTrue(
+            recipe.verify(ca, ref, _oracleAt(c.rateMin + 1), _expiry(), true, c, data), "one wei above the floor"
+        );
+        assertTrue(recipe.verify(ca, ref, _oracleAt(ONE), _expiry(), true, c, data), "at the anchor");
+        assertTrue(
+            recipe.verify(ca, ref, _oracleAt(c.rateMax - 1), _expiry(), true, c, data), "one wei below the ceiling"
+        );
 
-        assertFalse(recipe.verify(ca, ref, _oracleAt(c.rateMin), c, data), "exactly on the floor: excluded");
-        assertFalse(recipe.verify(ca, ref, _oracleAt(c.rateMax), c, data), "exactly on the ceiling: excluded");
-        assertFalse(recipe.verify(ca, ref, _oracleAt(c.rateMin - 1), c, data), "one wei below the floor");
-        assertFalse(recipe.verify(ca, ref, _oracleAt(c.rateMax + 1), c, data), "one wei above the ceiling");
-        assertFalse(recipe.verify(ca, ref, _oracleAt(1000 * ONE), c, data), "a thousand times over");
+        assertFalse(
+            recipe.verify(ca, ref, _oracleAt(c.rateMin), _expiry(), true, c, data), "exactly on the floor: excluded"
+        );
+        assertFalse(
+            recipe.verify(ca, ref, _oracleAt(c.rateMax), _expiry(), true, c, data), "exactly on the ceiling: excluded"
+        );
+        assertFalse(
+            recipe.verify(ca, ref, _oracleAt(c.rateMin - 1), _expiry(), true, c, data), "one wei below the floor"
+        );
+        assertFalse(
+            recipe.verify(ca, ref, _oracleAt(c.rateMax + 1), _expiry(), true, c, data), "one wei above the ceiling"
+        );
+        assertFalse(recipe.verify(ca, ref, _oracleAt(1000 * ONE), _expiry(), true, c, data), "a thousand times over");
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // 5. Fuzz
+    // 5. verify — the market's life and the two dials
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// @notice THE BAND IS SIZED BY THE MARKET'S OWN LIFE, and this is the attack it closes. The band
+    ///         is linear in the declared `durationSeconds`, and before this rule nothing tied that
+    ///         number to the market: a one-hour market could carry the band of a 30-day one, 720 times
+    ///         wider than the policy allows. On the fill that creates the pool, `verify` is handed the
+    ///         market's expiry and refuses a declared life longer than the life that remains.
+    function test_apySpread_verify_creating_refusesADeclaredLifeLongerThanTheMarkets() public {
+        address oracle = _oracleAt(ONE);
+        bytes memory thirtyDays = _data(0, 30 days, 10 * PCT);
+        IMarketRegistry.ResolvedConstraint memory c = recipe.resolve(ca, ref, oracle, thirtyDays);
+
+        uint256 oneHourMarket = block.timestamp + 1 hours;
+        assertFalse(
+            recipe.verify(ca, ref, oracle, oneHourMarket, true, c, thirtyDays), "a 30-day band on a 1-hour market"
+        );
+
+        // Control: the honest payload for that market, declaring exactly the hour it lives.
+        bytes memory oneHour = _data(0, 1 hours, 10 * PCT);
+        IMarketRegistry.ResolvedConstraint memory honest = recipe.resolve(ca, ref, oracle, oneHour);
+        assertTrue(recipe.verify(ca, ref, oracle, oneHourMarket, true, honest, oneHour), "the honest band is accepted");
+        assertLt(honest.rateMax - honest.rateMin, c.rateMax - c.rateMin, "and it really is the narrower window");
+    }
+
+    /// @notice The life bound is INCLUSIVE and exact: a declared life equal to the market's remaining
+    ///         life is accepted, one second more is refused.
+    function test_apySpread_verify_creating_lifeBoundaryIsExact() public {
+        address oracle = _oracleAt(ONE);
+        uint256 life = 30 days;
+        uint256 expiry = block.timestamp + life;
+
+        bytes memory exact = _data(0, life, 10 * PCT);
+        IMarketRegistry.ResolvedConstraint memory c = recipe.resolve(ca, ref, oracle, exact);
+        assertTrue(recipe.verify(ca, ref, oracle, expiry, true, c, exact), "exactly the market's life");
+
+        bytes memory oneMore = _data(0, life + 1, 10 * PCT);
+        IMarketRegistry.ResolvedConstraint memory d = recipe.resolve(ca, ref, oracle, oneMore);
+        assertFalse(recipe.verify(ca, ref, oracle, expiry, true, d, oneMore), "one second past it");
+    }
+
+    /// @notice An expired market has no life left, so no declared life fits: the creating fill is
+    ///         refused whether the expiry is in the past or is this very second.
+    function test_apySpread_verify_creating_refusesAnExpiredMarket() public {
+        address oracle = _oracleAt(ONE);
+        bytes memory data = _data(0, 1, 10 * PCT); // the shortest life there is
+        IMarketRegistry.ResolvedConstraint memory c = recipe.resolve(ca, ref, oracle, data);
+
+        vm.warp(1_000_000);
+        assertFalse(recipe.verify(ca, ref, oracle, block.timestamp, true, c, data), "expiring this second");
+        assertFalse(recipe.verify(ca, ref, oracle, block.timestamp - 1, true, c, data), "already expired");
+        assertTrue(recipe.verify(ca, ref, oracle, block.timestamp + 1, true, c, data), "control: one second of life");
+    }
+
+    /// @notice THE LIFE RULE IS CREATION-ONLY, and here is why it cannot be anything else. The
+    ///         remaining life shrinks every block while the signed duration is fixed, so re-checking
+    ///         on every fill would strand every resting order one block after creation. A tolerance
+    ///         only moves that deadline. The constraint is part of the pool id, so nothing about the
+    ///         declared life can change after creation anyway; the only party that knows creation
+    ///         happened is the adapter, which is why it passes the flag.
+    function test_apySpread_verify_laterFill_doesNotRecheckTheLife() public {
+        address oracle = _oracleAt(ONE);
+        bytes memory data = _data(0, 30 days, 10 * PCT);
+        IMarketRegistry.ResolvedConstraint memory c = recipe.resolve(ca, ref, oracle, data);
+
+        uint256 expiry = block.timestamp + 30 days;
+        assertTrue(recipe.verify(ca, ref, oracle, expiry, true, c, data), "created with exactly its life");
+
+        vm.warp(block.timestamp + 1);
+        assertFalse(recipe.verify(ca, ref, oracle, expiry, true, c, data), "one block later a CREATING fill would fail");
+        assertTrue(recipe.verify(ca, ref, oracle, expiry, false, c, data), "but a later fill into the pool does not");
+
+        vm.warp(expiry - 1);
+        assertTrue(recipe.verify(ca, ref, oracle, expiry, false, c, data), "right up to the market's last second");
+    }
+
+    /// @notice A later fill applies no life bound, so a garbage duration reaches the band arithmetic.
+    ///         It must come back as a plain `false`, the same answer the creating fill gives, not as
+    ///         an arithmetic panic: through the adapter that would surface as `Panic(0x11)` instead of
+    ///         `RecipeRejectedConstraint`.
+    function test_apySpread_verify_laterFill_garbageDurationReturnsFalse() public {
+        address oracle = _oracleAt(ONE);
+        bytes memory honest = _data(0, 30 days, 10 * PCT);
+        IMarketRegistry.ResolvedConstraint memory c = recipe.resolve(ca, ref, oracle, honest);
+
+        // Large enough that `spread * duration` does not fit in 256 bits. It is refused as a life no
+        // spread could ever fit under the band cap, before the product is formed.
+        bytes memory garbage = _data(0, type(uint256).max, 10 * PCT);
+        assertFalse(recipe.verify(ca, ref, oracle, _expiry(), false, c, garbage), "a later fill refuses it quietly");
+        assertFalse(recipe.verify(ca, ref, oracle, _expiry(), true, c, garbage), "and the creating fill agrees");
+    }
+
+    /// @notice THE SECOND DIAL. `(30 days, 12%)` and `(1 day, 360%)` produce the same band, so
+    ///         binding the life alone would only push an author toward the spread. The spread ceiling
+    ///         is what stops that: the first pair is honest and verifies on a 30-day market, the second
+    ///         is refused by `verify` and reverts `SpreadTooHigh` in `resolve`.
+    function test_apySpread_sameBandFromTwoPairs_theHighSpreadOneIsRefused() public {
+        address oracle = _oracleAt(ONE);
+        uint256 band = (12 * PCT * 30 days) / YEAR;
+        assertEq((360 * PCT * 1 days) / YEAR, band, "fixture precondition: the two pairs give the same band");
+
+        bytes memory honest = _data(0, 30 days, 12 * PCT);
+        IMarketRegistry.ResolvedConstraint memory c = recipe.resolve(ca, ref, oracle, honest);
+        assertTrue(recipe.verify(ca, ref, oracle, block.timestamp + 30 days, true, c, honest), "the honest pair");
+
+        bytes memory inflated = _data(0, 1 days, 360 * PCT);
+        vm.expectRevert(abi.encodeWithSelector(ApySpreadImpairmentRecipe.SpreadTooHigh.selector, 360 * PCT, 100 * PCT));
+        recipe.resolve(ca, ref, oracle, inflated);
+
+        // The constraint is the same bytes either way; only the payload differs, and verify refuses it
+        // on a market long enough for the declared day, so the refusal is the spread and not the life.
+        assertFalse(recipe.verify(ca, ref, oracle, block.timestamp + 30 days, true, c, inflated), "the inflated pair");
+        assertFalse(recipe.verify(ca, ref, oracle, block.timestamp + 30 days, false, c, inflated), "on any fill");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // 6. Fuzz
     // ═══════════════════════════════════════════════════════════════════════════
 
     /// @notice THE ROUND TRIP, and the single most valuable property in this file: whatever `resolve`
@@ -635,7 +904,7 @@ contract ApySpreadImpairmentRecipeTest is RegistryFixture {
         _assertConstraintEq(c, _expected(anchor, duration, spread), "resolve follows the formula");
         assertEq((c.rateMin + c.rateMax) / 2, anchor, "the midpoint IS the anchor, exactly");
 
-        assertTrue(recipe.verify(ca, ref, oracle, c, data), "verify must accept what resolve produced");
+        assertTrue(recipe.verify(ca, ref, oracle, _expiry(), true, c, data), "verify must accept what resolve produced");
     }
 
     /// @notice Phoenix's two rules, fuzzed: no constraint this recipe returns can have a zero floor or
@@ -669,7 +938,7 @@ contract ApySpreadImpairmentRecipeTest is RegistryFixture {
         IMarketRegistry.ResolvedConstraint memory c = recipe.resolve(ca, ref, address(0), _data(ONE, YEAR, 10 * PCT));
 
         assertEq(
-            recipe.verify(ca, ref, _oracleAt(live), c, data),
+            recipe.verify(ca, ref, _oracleAt(live), _expiry(), true, c, data),
             live > c.rateMin && live < c.rateMax,
             "the verdict IS window containment, at every live rate"
         );

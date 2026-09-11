@@ -84,27 +84,27 @@ contract WalkTenAssetForkTest is RegistryFixture {
 
         // ── Point 1: every present source is validated on the way in, and stored verbatim ──
         //
-        // `"USD"` reaches US Dollars in ZERO hops, so those two writes need no feed. `"ETH"` needs the
+        // US Dollars reaches US Dollars in ZERO hops, so those two writes need no feed. Ether needs the
         // one edge `_setUpRegistry` added; without it this write would revert `NoConversionPathToUsd`
         // because an aggregator source has a budget of exactly one hop.
-        _addLeaf(usdc, "USDC", "USD");
-        _addLeaf(weth, "WETH", "ETH");
-        _addLeaf(usde, "USDe", "USD");
+        _addLeaf(usdc, "USDC", USD_UNIT);
+        _addLeaf(weth, "WETH", ETH_UNIT);
+        _addLeaf(usde, "USDe", USD_UNIT);
 
-        assertEq(_price(usdc), "USD", "fork: USDC price source did not store USD");
-        assertEq(_price(weth), "ETH", "fork: WETH price source did not store ETH");
-        assertEq(_price(usde), "USD", "fork: USDe price source did not store USD");
+        assertEq(_price(usdc), USD_UNIT, "fork: USDC price source did not store USD");
+        assertEq(_price(weth), ETH_UNIT, "fork: WETH price source did not store ETH");
+        assertEq(_price(usde), USD_UNIT, "fork: USDe price source did not store USD");
 
-        // A vault source's label is the unit the vault's OWN underlying is quoted in — sUSDe holds USDe,
+        // A vault source's unit is the unit the vault's OWN underlying is quoted in — sUSDe holds USDe,
         // which is a dollar asset — and it lands in the NAV slot with two hops of budget.
         _addVault(sUsde, "sUSDe");
-        assertEq(_nav(sUsde), "USD", "fork: sUSDe NAV source did not store USD");
+        assertEq(_nav(sUsde), USD_UNIT, "fork: sUSDe NAV source did not store USD");
 
-        // The absent slot reads back EMPTY, and that is a real answer rather than an error: `addAsset`
+        // The absent slot reads back ZERO, and that is a real answer rather than an error: `addAsset`
         // zeroes an absent source instead of copying it.
         (, IMarketRegistry.Asset memory vault) = iReg.lookupAssetByAddress(sUsde);
         assertEq(vault.priceSource.addr, address(0), "fork: the vault must have no price source");
-        assertEq(_price(sUsde), "", "fork: an absent source must carry no denomination");
+        assertEq(_price(sUsde), address(0), "fork: an absent source must carry no denomination");
 
         // ── Point 2: `deploy` reads both legs' decimals LIVE, off real contracts ──
         //
@@ -113,7 +113,7 @@ contract WalkTenAssetForkTest is RegistryFixture {
         uint8 shareDecimals = IERC20Metadata(sUsde).decimals();
         uint8 usdcDecimals = IERC20Metadata(usdc).decimals();
 
-        address wrapper = iReg.deploy(usdc, sUsde, IMarketRegistry.OracleMode.NAV);
+        address wrapper = iReg.deploy(usdc, sUsde, IMarketRegistry.OracleMode.NAV, bytes32(0));
         assertTrue(wrapper != address(0), "fork: deploy returned no wrapper");
         assertEq(
             iReg.lookupWrapper(usdc, sUsde, IMarketRegistry.OracleMode.NAV),
@@ -166,22 +166,22 @@ contract WalkTenAssetForkTest is RegistryFixture {
 
     /// @dev A plain token with one PRICE source carrying `denomination`. The source address is the token
     ///      itself: the registry never CALLS a price source, it only records the address into `feed1` and
-    ///      validates the declared label, so no live aggregator is needed here.
-    function _addLeaf(address addr, string memory name, string memory denomination) internal {
+    ///      validates the declared unit, so no live aggregator is needed here.
+    function _addLeaf(address addr, string memory name, address denomination) internal {
         iReg.addAssets(one(mkPriceOnlyAsset(addr, name, addr, denomination)));
     }
 
-    /// @dev A real ERC-4626 vault as a NAV source. `"USD"` describes the VAULT'S UNDERLYING (see
+    /// @dev A real ERC-4626 vault as a NAV source. US Dollars describes the VAULT'S UNDERLYING (see
     ///      `AssetSource.denomination`), which for sUSDe is USDe, and resolves in zero hops.
     function _addVault(address addr, string memory name) internal {
-        iReg.addAssets(one(mkNavOnlyAsset(addr, name, addr, "USD")));
+        iReg.addAssets(one(mkNavOnlyAsset(addr, name, addr, USD_UNIT)));
     }
 
-    function _price(address addr) internal view returns (string memory) {
+    function _price(address addr) internal view returns (address) {
         return _storedDenomination(addr, IMarketRegistry.SourceType.PRICE);
     }
 
-    function _nav(address addr) internal view returns (string memory) {
+    function _nav(address addr) internal view returns (address) {
         return _storedDenomination(addr, IMarketRegistry.SourceType.NAV);
     }
 }

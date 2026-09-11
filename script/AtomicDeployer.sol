@@ -42,29 +42,32 @@ contract AtomicDeployer {
     }
 
     error InitializeFailed(uint256 index, bytes reason);
+    error TargetOccupied(uint256 index, address target);
 
     event ContractDeployed(address indexed deployed, address indexed sender, bytes32 salt);
 
     /// @notice Deploys and initializes a batch under the caller-guarded salt.
-    /// @dev An occupied target is skipped: its CREATE2 address already commits to the exact creation code, so the
-    ///      code there can only have come from the same init code. The source-owned deployment script separately
-    ///      verifies initializer state and safe prefix recovery before calling this function.
+    /// @dev An occupied target is refused, not skipped. Occupancy proves the creation code — the CREATE2 address
+    ///      commits to it — but it says nothing about the initializer: the contract there may hold any
+    ///      configuration, or none. This contract only initializes what it created itself, in the same
+    ///      transaction, so it cannot vouch for a contract it did not create. Anything already deployed must be
+    ///      verified by the caller and left out of the batch; the source-owned deployment script does exactly that.
     function deploy(bytes32 salt, Deployment[] calldata deployments) external returns (address[] memory deployed) {
         bytes32 guardedSalt = _guard(msg.sender, salt);
         deployed = new address[](deployments.length);
 
         for (uint256 i; i < deployments.length; ++i) {
             address predicted = Create2.computeAddress(guardedSalt, keccak256(deployments[i].initCode));
-            if (predicted.code.length == 0) {
-                predicted = Create2.deploy(0, guardedSalt, deployments[i].initCode);
-                if (deployments[i].initCall.length != 0) {
-                    (bool ok, bytes memory reason) = predicted.call(deployments[i].initCall);
-                    if (!ok) revert InitializeFailed(i, reason);
-                }
-                emit ContractDeployed(predicted, msg.sender, salt);
-            }
+            if (predicted.code.length != 0) revert TargetOccupied(i, predicted);
 
-            deployed[i] = predicted;
+            address created = Create2.deploy(0, guardedSalt, deployments[i].initCode);
+            if (deployments[i].initCall.length != 0) {
+                (bool ok, bytes memory reason) = created.call(deployments[i].initCall);
+                if (!ok) revert InitializeFailed(i, reason);
+            }
+            emit ContractDeployed(created, msg.sender, salt);
+
+            deployed[i] = created;
         }
     }
 

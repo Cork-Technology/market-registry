@@ -33,9 +33,8 @@ contract MarketRegistry is MarketRegistryRecipe, Initializable, IVersion {
     // ── leg resolution (internal shapes) ────────────────────────────────────────
 
     /// @dev Which source one leg resolved to, and where to find it again. Produced by `_selectLeg`
-    ///      using STORAGE READS ONLY — no external call — because the wrapper key is derived from it
-    ///      and a repeat `deploy` must be able to short-circuit on that key without touching another
-    ///      contract.
+    ///      using STORAGE READS ONLY — no external call — so an unregistered asset or a leg that cannot
+    ///      serve the mode is refused before the registry touches another contract.
     ///
     ///      `useNav` records which FIELD was selected, not how the source is read. Those are different
     ///      questions: a `NAV` source may legitimately declare `SourceInterface.AGGREGATOR_V3` (an
@@ -44,28 +43,23 @@ contract MarketRegistry is MarketRegistryRecipe, Initializable, IVersion {
     ///      of storage rather than caching a second flag here.
     struct LegSelection {
         bytes32 assetKey; // the leg's asset key, so `_wireLeg` can re-read the chosen source
-        address source; // the resolved source address; goes into the wrapper key and both salts
+        address source; // the resolved source address; lands in the leg's wiring and is named in `MarketOracleDeployed`
         bool useNav; // true when the NAV field was selected, false when the price field was
     }
 
     /// @dev One side of the Morpho oracle, fully resolved. Bundled into a struct so the twelve-argument
     ///      factory call can be assembled from two memory pointers instead of ten live locals — see
     ///      the stack-limit note on the contract.
+    ///
+    ///      This struct IS the wrapper's identity. The key `deploy` records under is a hash of the mode
+    ///      and both legs' wiring, byte for byte what the factory is handed, so every field here is a
+    ///      field a governance edit can re-key a pair on. Add a field and the key moves with it.
     struct LegWiring {
         address vault; // the ERC-4626 vault, or `address(0)` for a feed-shaped leg
         uint256 sample; // `10 ** shareDecimals` with a vault; EXACTLY 1 without one (the oracle requires it)
         address feed1; // the source aggregator, or the first bridge hop on a vault leg
         address feed2; // the bridge hop; `address(0)` when the leg's unit is already US Dollars
         uint256 tokenDecimals; // the token's own decimals; DEAD on a vault leg (the factory derives them)
-    }
-
-    /// @dev `_selectLeg` outcomes. Three states rather than a bool because `deploy` must revert with
-    ///      the right selector while `lookupWrapper` must not revert at all, and both share one
-    ///      resolver.
-    enum LegStatus {
-        OK,
-        UNKNOWN_ASSET,
-        NO_SOURCE
     }
 
     /// @dev The deploying `AtomicDeployer` is a placeholder owner only: it calls `initialize` in the same
@@ -88,8 +82,10 @@ contract MarketRegistry is MarketRegistryRecipe, Initializable, IVersion {
         WRAPPER_FACTORY = wrapperFactory;
         FIXED_RATE_ORACLE_FACTORY = fixedRateOracleFactory;
 
-        _addDenomination("USD", MarketRegistryLib.USD_DENOMINATION);
-        _addDenomination("ETH", MarketRegistryLib.ETH_DENOMINATION);
+        // The two Chainlink pseudo-units every registry starts with: the US-Dollar terminus every
+        // bridge walk ends at, and Ether as the first bridge candidate.
+        _addDenomination(MarketRegistryLib.USD_DENOMINATION);
+        _addDenomination(MarketRegistryLib.ETH_DENOMINATION);
 
         // Through the same setter the owner uses, so the starting value is emitted rather than
         // silently written. A replayer that only reads logs must never have to guess where the bound
@@ -111,46 +107,52 @@ contract MarketRegistry is MarketRegistryRecipe, Initializable, IVersion {
     ///
     ///      1. Resolve each leg's source, per leg. Storage reads only — no external call.
     ///      2. Apply the one CROSS-leg guard: in `NAV` mode at least one leg must have brought a real
-    ///         NAV source. It sits ahead of the short-circuit deliberately. A NAV-mode call with no NAV
-    ///         source anywhere resolves to exactly the sources `PRICE` mode would, so it computes the
-    ///         PRICE wrapper's key — and if that wrapper is already recorded, a guard placed after the
-    ///         short-circuit would hand it back as though it were a NAV oracle. Guarding first makes the
-    ///         call fail identically whether or not the pair has been deployed before.
-    ///      3. Derive the key from `(address(this), ca, ref, caSource, refSource)`. The source
-    ///         addresses differ between modes, so a NAV wrapper and a price wrapper for the same pair
-    ///         can no longer land on the same mapping entry or the same `CREATE2` address. The
-    ///         registry's own address is in the hash because the key doubles as the factory salt and
-    ///         the record of past deployments lives HERE, not in the factory: a redeployed registry
-    ///         pointed at the same factory starts with an empty record, and without its address in the
-    ///         salt its first `deploy` of an already-built pair would re-derive the old salt and revert
-    ///         on the `CREATE2` collision with no error data.
-    ///      4. Short-circuit on a recorded key. No write, no event, no external call — which is why
-    ///         steps 1 and 2 must not make one either.
-    ///      5. Build, then record, then emit.
+    ///         NAV source. Without it a NAV-mode call with no NAV source anywhere would resolve to
+    ///         exactly the wiring `PRICE` mode resolves to, and — because the mode is in the key —
+    ///         build a second wrapper that is a price oracle in all but name. Refusing tells the
+    ///         caller to ask for `PRICE`.
+    ///      3. Wire both legs in full — denomination check, bridge path, vault and token decimals —
+    ///         and derive the key from the mode and that wiring. The key is exactly as fine as the
+    ///         arguments the factory receives: a governance edit that changes what the factory would
+    ///         be handed for this pair moves the pair to a new key, and one that changes nothing the
+    ///         factory sees keeps serving the same wrapper. So a removed feed or denomination makes a
+    ///         repeat `deploy` fail with the same error a first `deploy` would, instead of serving a wrapper
+    ///         built for wiring governance has since withdrawn; and a re-added feed re-keys and
+    ///         rebuilds. The registry's own address is in the hash because the key seeds the
+    ///         factory salt and the record of past deployments lives HERE, not in the factory: a
+    ///         redeployed registry pointed at the same factory starts with an empty record, and
+    ///         without its address in the salt its first `deploy` of an already-built pair would
+    ///         re-derive the old salt and revert on the `CREATE2` collision with no error data.
+    ///      4. Short-circuit on a recorded key. No write, no event, no factory call. A cache hit
+    ///         still pays for the wiring reads — two token `decimals()`, the vault `decimals()` on a
+    ///         vault leg, the denomination check and the path walk — which is the price of a key
+    ///         that cannot go stale.
+    ///      5. Mix the caller's `oracleSalt` into the key to get the factory salt, then build, record
+    ///         and emit. The salt is NOT part of the key. The key answers "which wrapper serves this
+    ///         pair"; the salt answers "where does it land". A salt that is a pure function of the key
+    ///         can be spent by anyone ahead of time at the permissionless Morpho factory, and the
+    ///         registry would then collide on it forever. With the caller's entropy in the salt, a
+    ///         pre-spent salt costs the caller one failed call and a new salt, not the pair.
     ///
-    ///      All of step 5's resolution happens BEFORE the factory is called, so a `deploy` that fails
-    ///      on an unreachable denomination writes nothing at all.
-    function deploy(address ca, address ref, OracleMode mode) external override returns (address wrapper) {
-        (, LegSelection memory caSel) = _selectLeg(ca, mode, true);
-        (, LegSelection memory refSel) = _selectLeg(ref, mode, true);
+    ///      All of the resolution happens BEFORE the factory is called, so a `deploy` that fails on an
+    ///      unreachable denomination writes nothing at all.
+    function deploy(address ca, address ref, OracleMode mode, bytes32 oracleSalt)
+        external
+        override
+        returns (address wrapper)
+    {
+        (address caSource, address refSource, LegWiring memory base, LegWiring memory quote) =
+            _resolvePair(ca, ref, mode);
+        bytes32 key = _wrapperKey(ca, ref, mode, base, quote);
 
-        // Guard 1 of `OracleMode.NAV`: without it, a NAV-mode call in which NEITHER leg has a NAV
-        // source would fall back to the price source on both legs and produce byte-for-byte the
-        // wrapper `PRICE` mode produces — same key, same salt, same address, same numbers — under a
-        // name claiming otherwise. Refusing tells the caller to ask for `PRICE`.
-        if (mode == OracleMode.NAV && !caSel.useNav && !refSel.useNav) {
-            revert NavModeWithoutNavSource(ca, ref);
-        }
-
-        bytes32 key = keccak256(abi.encode(address(this), ca, ref, caSel.source, refSel.source));
         wrapper = _wrappers[key];
         if (wrapper != address(0)) return wrapper;
 
-        wrapper = _buildWrapper(ca, ref, caSel, refSel, key);
+        wrapper = _callFactory(base, quote, keccak256(abi.encode(key, oracleSalt)));
         if (wrapper == address(0)) revert ZeroAddress();
 
         _wrappers[key] = wrapper;
-        emit MarketOracleDeployed(ca, ref, wrapper, mode, caSel.source, refSel.source, msg.sender);
+        emit MarketOracleDeployed(ca, ref, wrapper, mode, caSource, refSource, msg.sender);
     }
 
     // ── fixed-rate oracle entrypoint (permissionless, stateless) ───────────────
@@ -246,19 +248,18 @@ contract MarketRegistry is MarketRegistryRecipe, Initializable, IVersion {
     }
 
     /// @inheritdoc IMarketRegistry
-    function addDenominations(string[] calldata labels, address[] calldata units) external override onlyOwner {
-        uint256 len = labels.length;
-        if (len != units.length) revert ArrayLengthMismatch();
+    function addDenominations(address[] calldata units) external override onlyOwner {
+        uint256 len = units.length;
         for (uint256 i = 0; i < len; ++i) {
-            _addDenomination(labels[i], units[i]);
+            _addDenomination(units[i]);
         }
     }
 
     /// @inheritdoc IMarketRegistry
-    function removeDenominations(string[] calldata labels) external override onlyOwner {
-        uint256 len = labels.length;
+    function removeDenominations(address[] calldata units) external override onlyOwner {
+        uint256 len = units.length;
         for (uint256 i = 0; i < len; ++i) {
-            _removeDenomination(labels[i]);
+            _removeDenomination(units[i]);
         }
     }
 
@@ -314,27 +315,34 @@ contract MarketRegistry is MarketRegistryRecipe, Initializable, IVersion {
     }
 
     /// @inheritdoc IMarketRegistry
-    /// @dev A registered label always names a non-zero unit, so the unit doubles as the membership
-    ///      test and this never needs to touch `_denominationIndex`.
-    function lookupDenomination(string calldata label) external view override returns (bool found, address unit) {
-        unit = _denominations[keccak256(bytes(label))];
-        found = unit != address(0);
+    function isDenomination(address unit) external view override returns (bool) {
+        return _denominationIndex[unit] != 0;
     }
 
     /// @inheritdoc IMarketRegistry
-    /// @dev Re-runs the same per-leg selection `deploy` does, so it answers for exactly the wrapper
-    ///      `deploy(ca, ref, mode)` would return — including which source each leg fell back to. It
-    ///      never reverts: an unregistered asset, a leg that cannot serve the mode, and a NAV-mode call
-    ///      with no NAV source anywhere all mean "there is no wrapper for that", which is the same
-    ///      answer as "not deployed yet" and is correctly reported as the zero address.
-    function lookupWrapper(address ca, address ref, OracleMode mode) external view override returns (address wrapper) {
-        (LegStatus caStatus, LegSelection memory caSel) = _selectLeg(ca, mode, false);
-        if (caStatus != LegStatus.OK) return address(0);
-        (LegStatus refStatus, LegSelection memory refSel) = _selectLeg(ref, mode, false);
-        if (refStatus != LegStatus.OK) return address(0);
-        if (mode == OracleMode.NAV && !caSel.useNav && !refSel.useNav) return address(0);
+    /// @dev The one resolver behind `deploy`, exposed as a view. It reverts for every reason `deploy`
+    ///      would, and for the same reason: an integrator who predicts the wrapper address from this
+    ///      key must learn that the pair is not deployable the same way a deployer would.
+    function wrapperKey(address ca, address ref, OracleMode mode) external view override returns (bytes32) {
+        (,, LegWiring memory base, LegWiring memory quote) = _resolvePair(ca, ref, mode);
+        return _wrapperKey(ca, ref, mode, base, quote);
+    }
 
-        wrapper = _wrappers[keccak256(abi.encode(address(this), ca, ref, caSel.source, refSel.source))];
+    /// @inheritdoc IMarketRegistry
+    /// @dev Answers for exactly the wrapper `deploy(ca, ref, mode, anySalt)` would return, because it derives
+    ///      the same key. It never reverts: an unregistered asset, a leg that cannot serve the mode, a
+    ///      NAV-mode call with no NAV source anywhere, a removed denomination or feed, and a token whose
+    ///      `decimals()` cannot be read all mean "there is no wrapper for that", which is the same
+    ///      answer as "not deployed yet" and is correctly reported as the zero address. The self-call
+    ///      is what turns every one of those reverts into that answer without a second resolver that
+    ///      could drift from the first. The same catch swallows an out-of-gas inside the self-call, so
+    ///      a gas-starved caller also reads zero; zero means "not found", never "proven absent".
+    function lookupWrapper(address ca, address ref, OracleMode mode) external view override returns (address wrapper) {
+        try this.wrapperKey(ca, ref, mode) returns (bytes32 key) {
+            wrapper = _wrappers[key];
+        } catch {
+            wrapper = address(0);
+        }
     }
 
     // ── enumeration (paginated) ────────────────────────────────────────────────
@@ -374,37 +382,48 @@ contract MarketRegistry is MarketRegistryRecipe, Initializable, IVersion {
         external
         view
         override
-        returns (IMarketRegistry.Denomination[] memory page, uint256 total)
+        returns (address[] memory page, uint256 total)
     {
         total = _denominationKeys.length;
         (uint256 start, uint256 count) = MarketRegistryLib.pageBounds(total, offset, limit);
-        page = new IMarketRegistry.Denomination[](count);
+        page = new address[](count);
         for (uint256 i = 0; i < count; ++i) {
-            bytes32 labelHash = _denominationKeys[start + i];
-            // The unit is read back through the mapping rather than cached alongside the key, so a
-            // label the owner has re-pointed reports its CURRENT unit. See the note on slot 13.
-            page[i] = IMarketRegistry.Denomination({labelHash: labelHash, unit: _denominations[labelHash]});
+            page[i] = _denominationKeys[start + i];
         }
     }
 
     // ── internals: leg resolution and the factory call ──────────────────────────
 
-    /// @dev Per-leg source selection, shared by `deploy` and `lookupWrapper`.
-    ///
-    ///      `strict` picks how a failure is REPORTED, never what is selected. `deploy` has to fail
-    ///      loudly with the selector naming what went wrong; `lookupWrapper` must never revert, because
-    ///      "this leg cannot resolve" and "no wrapper deployed yet" are the same answer to its caller.
-    ///      One body so the two paths cannot drift apart.
-    function _selectLeg(address asset, OracleMode mode, bool strict)
+    /// @dev Everything `deploy` needs to know about a pair short of whether it was built before: the
+    ///      two resolved sources (for the event) and the two fully wired legs (for the key and the
+    ///      factory). Shared by `deploy` and `wrapperKey` so the key a reader derives is the key
+    ///      `deploy` records under — one body, so the two cannot drift apart.
+    function _resolvePair(address ca, address ref, OracleMode mode)
         private
         view
-        returns (LegStatus status, LegSelection memory sel)
+        returns (address caSource, address refSource, LegWiring memory base, LegWiring memory quote)
     {
-        sel.assetKey = MarketRegistryLib.assetKey(asset);
-        if (_assetIndex[sel.assetKey] == 0) {
-            if (strict) revert EntryNotFound();
-            return (LegStatus.UNKNOWN_ASSET, sel);
+        LegSelection memory caSel = _selectLeg(ca, mode);
+        LegSelection memory refSel = _selectLeg(ref, mode);
+
+        // Guard 1 of `OracleMode.NAV`: without it, a NAV-mode call in which NEITHER leg has a NAV
+        // source would fall back to the price source on both legs and produce byte-for-byte the
+        // wiring `PRICE` mode produces, under a name claiming otherwise. Refusing tells the caller to
+        // ask for `PRICE`.
+        if (mode == OracleMode.NAV && !caSel.useNav && !refSel.useNav) {
+            revert NavModeWithoutNavSource(ca, ref);
         }
+
+        (base, quote) = _wirePair(ca, ref, caSel, refSel);
+        caSource = caSel.source;
+        refSource = refSel.source;
+    }
+
+    /// @dev Per-leg source selection. Reverts with the selector naming what went wrong; `lookupWrapper`
+    ///      turns that revert into the zero address by catching it around `wrapperKey`.
+    function _selectLeg(address asset, OracleMode mode) private view returns (LegSelection memory sel) {
+        sel.assetKey = MarketRegistryLib.assetKey(asset);
+        if (_assetIndex[sel.assetKey] == 0) revert EntryNotFound();
 
         IMarketRegistry.Asset storage a = _assets[sel.assetKey];
 
@@ -413,22 +432,18 @@ contract MarketRegistry is MarketRegistryRecipe, Initializable, IVersion {
             if (nav != address(0)) {
                 sel.source = nav;
                 sel.useNav = true;
-                return (LegStatus.OK, sel);
+                return sel;
             }
-            // Fall through to this leg's price source. Not silent: `sel.source` ends up in the wrapper
-            // key and both salts, so the fallback is recorded on-chain and readable through
-            // `lookupWrapper`.
+            // Fall through to this leg's price source. Not silent: the source lands in the leg's
+            // wiring, which the key and salt are derived from, and `MarketOracleDeployed` names it,
+            // so the fallback is recorded on-chain.
         }
 
         sel.source = a.priceSource.addr;
-        if (sel.source == address(0)) {
-            if (strict) revert MissingSource(asset, mode);
-            return (LegStatus.NO_SOURCE, sel);
-        }
-        status = LegStatus.OK;
+        if (sel.source == address(0)) revert MissingSource(asset, mode);
     }
 
-    /// @dev Turn both selections into oracle arguments and make the one factory call.
+    /// @dev Turn both selections into the two sides of the Morpho oracle.
     ///
     ///      ## Orientation is fixed: REF is base, CA is quote
     ///
@@ -436,26 +451,37 @@ contract MarketRegistry is MarketRegistryRecipe, Initializable, IVersion {
     ///      `quoteFeed1` from the COLLATERAL asset, and the decimals arguments follow the same
     ///      assignment. Swapping it inverts every price this registry produces, silently.
     ///
-    ///      ALL resolution — bridge feeds, vault decimals, token decimals — happens in the two
-    ///      `_wireLeg` calls, BEFORE `_callFactory`. So a build that fails on an unreachable
-    ///      denomination or an unregistered label has deployed nothing and written nothing.
-    function _buildWrapper(address ca, address ref, LegSelection memory caSel, LegSelection memory refSel, bytes32 salt)
+    ///      ALL resolution — bridge feeds, vault decimals, token decimals — happens here, BEFORE the
+    ///      key is derived and BEFORE `_callFactory`. So what is keyed is what is built, and a build
+    ///      that fails on an unreachable or unregistered denomination has deployed nothing and written
+    ///      nothing.
+    function _wirePair(address ca, address ref, LegSelection memory caSel, LegSelection memory refSel)
         private
-        returns (address wrapper)
+        view
+        returns (LegWiring memory base, LegWiring memory quote)
     {
-        LegWiring memory base = _wireLeg(refSel, ref);
-        LegWiring memory quote = _wireLeg(caSel, ca);
-        wrapper = _callFactory(base, quote, salt);
+        base = _wireLeg(refSel, ref);
+        quote = _wireLeg(caSel, ca);
+    }
+
+    /// @dev The wrapper record's key, which also seeds the factory salt. Hashes the registry, the pair, the mode and
+    ///      the two wired legs in full — see `deploy` for why each of those is in it.
+    function _wrapperKey(address ca, address ref, OracleMode mode, LegWiring memory base, LegWiring memory quote)
+        private
+        view
+        returns (bytes32)
+    {
+        return keccak256(abi.encode(address(this), ca, ref, mode, base, quote));
     }
 
     function _wireLeg(LegSelection memory sel, address token) private view returns (LegWiring memory w) {
         IMarketRegistry.AssetSource storage src =
             sel.useNav ? _assets[sel.assetKey].navSource : _assets[sel.assetKey].priceSource;
 
-        // The label must still be registered at deploy time, and the unit is what the hop graph is
-        // keyed on. `addAssets` already checked this; re-checking costs one `SLOAD` and covers a label
-        // the owner has removed, or removed and re-added against a different unit, since.
-        address unit = _requireDenomination(src.denomination);
+        // The unit must still be registered at deploy time. `addAssets` already checked this;
+        // re-checking costs one `SLOAD` and covers a unit the owner has removed since.
+        address unit = src.denomination;
+        _requireDenomination(unit);
 
         w.tokenDecimals = IERC20Metadata(token).decimals();
 
@@ -463,8 +489,7 @@ contract MarketRegistry is MarketRegistryRecipe, Initializable, IVersion {
             w.vault = sel.source;
             // Shares, so it scales in SHARE decimals — read off the vault, which is an ERC-20.
             w.sample = 10 ** uint256(IERC20Metadata(sel.source).decimals());
-            address[] memory hops =
-                MarketRegistryLib.resolvePath(_feedIndex, _feeds, _denominationKeys, _denominations, unit, 2);
+            address[] memory hops = MarketRegistryLib.resolvePath(_feedIndex, _feeds, _denominationKeys, unit, 2);
             if (hops.length > 0) w.feed1 = hops[0];
             if (hops.length > 1) w.feed2 = hops[1];
         } else {
@@ -473,8 +498,7 @@ contract MarketRegistry is MarketRegistryRecipe, Initializable, IVersion {
             w.feed1 = sel.source;
             // Budget 1: `feed1` is taken by the source, so the single bridge hop goes to `feed2`. An
             // empty path means the unit already IS US Dollars, and a zero feed reads as the price 1.
-            address[] memory hops =
-                MarketRegistryLib.resolvePath(_feedIndex, _feeds, _denominationKeys, _denominations, unit, 1);
+            address[] memory hops = MarketRegistryLib.resolvePath(_feedIndex, _feeds, _denominationKeys, unit, 1);
             if (hops.length > 0) w.feed2 = hops[0];
         }
     }
@@ -502,43 +526,38 @@ contract MarketRegistry is MarketRegistryRecipe, Initializable, IVersion {
 
     // ── internals: denominations ────────────────────────────────────────────────
 
-    /// @dev Add-only, never overwrite. An existing label is rejected rather than re-pointed, so
-    ///      correcting a label's unit is a `removeDenominations` followed by an `addDenominations` and
-    ///      both halves land in the log. The old create-or-overwrite path left a re-point traceable
-    ///      only by noticing a second registration for the same hash.
-    function _addDenomination(string memory label, address unit) private {
-        if (bytes(label).length == 0) revert EmptyName();
+    /// @dev A duplicate is rejected rather than ignored, so the bridge search never carries the same
+    ///      candidate twice and every add lands in the log exactly once.
+    function _addDenomination(address unit) private {
         if (unit == address(0)) revert ZeroAddress();
+        if (_denominationIndex[unit] != 0) revert EntryAlreadyExists();
 
-        bytes32 labelHash = keccak256(bytes(label));
-        if (_denominationIndex[labelHash] != 0) revert EntryAlreadyExists();
-
-        _denominations[labelHash] = unit;
-        MarketRegistryLib.insertBytes32(_denominationKeys, _denominationIndex, labelHash);
-        // The payload is the only place the label's text survives on-chain; the store keeps hashes.
-        emit EntryAdded(Namespace.Denomination, labelHash, abi.encode(label, unit));
+        MarketRegistryLib.insertAddress(_denominationKeys, _denominationIndex, unit);
+        emit EntryAdded(Namespace.Denomination, _denominationKeyHash(unit), abi.encode(unit));
     }
 
-    /// @dev The mapping entry and the key array are cleared TOGETHER, which is what keeps
-    ///      `resolvePath`'s candidate list free of hashes that resolve to nothing. See slot 13.
-    function _removeDenomination(string calldata label) private {
-        bytes32 labelHash = keccak256(bytes(label));
-        if (_denominationIndex[labelHash] == 0) revert EntryNotFound();
+    function _removeDenomination(address unit) private {
+        if (_denominationIndex[unit] == 0) revert EntryNotFound();
 
-        MarketRegistryLib.removeBytes32(_denominationKeys, _denominationIndex, labelHash);
-        delete _denominations[labelHash];
-        emit EntryRemoved(Namespace.Denomination, labelHash, abi.encode(label));
+        MarketRegistryLib.removeAddress(_denominationKeys, _denominationIndex, unit);
+        emit EntryRemoved(Namespace.Denomination, _denominationKeyHash(unit), abi.encode(unit));
     }
 
-    function _requireDenomination(string memory label) private view returns (address unit) {
-        unit = _denominations[keccak256(bytes(label))];
-        if (unit == address(0)) revert UnregisteredDenomination(label);
+    /// @dev The event key for a denomination is the unit address itself, widened to 32 bytes — see
+    ///      the `EntryAdded` table on the interface.
+    function _denominationKeyHash(address unit) private pure returns (bytes32) {
+        return bytes32(uint256(uint160(unit)));
+    }
+
+    function _requireDenomination(address unit) private view {
+        if (_denominationIndex[unit] == 0) revert UnregisteredDenomination(unit);
     }
 
     function _validateSourcePath(IMarketRegistry.AssetSource calldata source) private view {
-        address unit = _requireDenomination(source.denomination);
+        address unit = source.denomination;
+        _requireDenomination(unit);
         uint256 budget = source.sourceInterface == IMarketRegistry.SourceInterface.ERC4626 ? 2 : 1;
-        MarketRegistryLib.resolvePath(_feedIndex, _feeds, _denominationKeys, _denominations, unit, budget);
+        MarketRegistryLib.resolvePath(_feedIndex, _feeds, _denominationKeys, unit, budget);
     }
 
     // ── internals: stores ───────────────────────────────────────────────────────
@@ -569,7 +588,7 @@ contract MarketRegistry is MarketRegistryRecipe, Initializable, IVersion {
         // Presence is `addr != 0`, and there is NO minimum. An asset with neither source is accepted —
         // see the sourceless-asset note above. Each `if` below is therefore the whole of the gate: an
         // absent source is skipped, so nothing validates a zero-address source and nothing reads the
-        // enum ordinals or the `denomination` string sitting behind it.
+        // enum ordinals or the `denomination` unit sitting behind it.
         bool hasPrice = e.priceSource.addr != address(0);
         bool hasNav = e.navSource.addr != address(0);
 
@@ -628,7 +647,7 @@ contract MarketRegistry is MarketRegistryRecipe, Initializable, IVersion {
             dst.addr = address(0);
             dst.sourceType = IMarketRegistry.SourceType.PRICE; // ordinal 0
             dst.sourceInterface = IMarketRegistry.SourceInterface.AGGREGATOR_V3; // ordinal 0
-            dst.denomination = "";
+            dst.denomination = address(0);
             return;
         }
         dst.addr = src.addr;
@@ -639,6 +658,6 @@ contract MarketRegistry is MarketRegistryRecipe, Initializable, IVersion {
 
     /// @inheritdoc IVersion
     function version() external pure returns (string memory) {
-        return "0.3.2";
+        return "0.5.0";
     }
 }

@@ -12,7 +12,8 @@ import {ILayerZeroEndpointV2} from "@layerzerolabs/lz-evm-protocol-v2/contracts/
 /// @notice Permissionless, idempotent factory for RemoteNavFeed. The factory fixes
 ///         only the LayerZero endpoint, and the read channel is a constant baked
 ///         into the feed; every other value a feed reads (target chain, lens,
-///         vault, confirmations, gas allowance, staleness bound, description) is committed by
+///         vault, confirmations, gas allowance, staleness bound, read library and
+///         verifier configuration, description) is committed by
 ///         the caller of `deploy` and covered by the
 ///         init-code hash, so it is visible in the feed's address — but the caller,
 ///         not the factory, declares it. Deployers of consumer integrations must
@@ -48,6 +49,8 @@ contract RemoteNavFeedFactory is IRemoteNavFeedFactory, IVersion {
                 params.confirmations,
                 params.gasAllowance,
                 params.maxStaleness,
+                params.readLibrary,
+                params.readConfig,
                 params.description
             )
         );
@@ -71,6 +74,8 @@ contract RemoteNavFeedFactory is IRemoteNavFeedFactory, IVersion {
                         params.confirmations,
                         params.gasAllowance,
                         params.maxStaleness,
+                        params.readLibrary,
+                        params.readConfig,
                         params.description
                     )
                 )
@@ -99,6 +104,6 @@ contract RemoteNavFeedFactory is IRemoteNavFeedFactory, IVersion {
 
     /// @inheritdoc IVersion
     function version() external pure returns (string memory) {
-        return "0.1.0";
+        return "0.2.0";
     }
 }

@@ -31,16 +31,17 @@ contract MockToken {
 ///
 ///           - Deterministic (default): returns a wrapper derived purely from `wrapperSalt` (and an
 ///             oracle from `morphoSalt`). Because `deploy` sets
-///             `salt = keccak256(abi.encode(registry, ca, ref, caSource, refSource))`, a test can predict the
-///             exact wrapper for a given pair AND resolved-source combination — that determinism is
-///             what makes the repeat / mode-separation cases assertable.
+///             `salt = keccak256(abi.encode(registry.wrapperKey(ca, ref, mode), oracleSalt))`, a test
+///             can predict the exact wrapper for a given pair, mode, wiring and caller salt with
+///             `predictWrapper(keccak256(abi.encode(registry.wrapperKey(...), oracleSalt)))` — that
+///             determinism is what makes the repeat / mode-separation / re-key cases assertable.
 ///           - ZeroWrapper: returns `address(0)` — drives the `ZeroAddress` gate.
 ///           - Fixed: returns a caller-set fixed wrapper on every call — drives the
 ///             arbitrary-return-recorded-verbatim case.
 ///           - Revert: reverts with {FactoryReverted} — proves a factory revert bubbles out of deploy.
 ///           - Reentrant: on its FIRST invocation (the outer deploy) it re-enters
 ///             `registry.deploy(ca2, ref2, mode2)` for a second registered pair, then returns the
-///             fixed wrapper. Because wrappers are keyed by pair AND resolved sources, the nested and
+///             fixed wrapper. Because wrappers are keyed by pair, mode AND wiring, the nested and
 ///             outer keys record independently. The mock snapshots whether the OUTER key was already
 ///             recorded at the moment the factory is entered — it must be false, proving `deploy`
 ///             writes nothing before the external call (CEI-by-construction).
@@ -134,26 +135,15 @@ contract MockWrapperFactory is IWrapperFactory {
 
     // ── deterministic predictors (mirror the mock's own derivation) ────────────────
 
+    /// @notice The wrapper `deploy` will return in Deterministic mode for a given salt. The registry's
+    ///         salt is `keccak256(abi.encode(wrapperKey(ca, ref, mode), oracleSalt))`, so a test predicts
+    ///         a deploy with `predictWrapper(keccak256(abi.encode(registry.wrapperKey(ca, ref, mode), oracleSalt)))`.
     function predictWrapper(bytes32 wrapperSalt) public pure returns (address) {
         return address(uint160(uint256(keccak256(abi.encode("wrapper", wrapperSalt)))));
     }
 
     function predictOracle(bytes32 morphoSalt) public pure returns (address) {
         return address(uint160(uint256(keccak256(abi.encode("oracle", morphoSalt)))));
-    }
-
-    /// @notice The wrapper `deploy` will return in Deterministic mode. The salt is
-    ///         `keccak256(abi.encode(registry, ca, ref, caSource, refSource))`, matching
-    ///         `MarketRegistry.deploy` — the two source addresses are the ones the requested
-    ///         `OracleMode` actually resolved to, which is why a NAV and a PRICE wrapper for the same
-    ///         pair land on different addresses, and the registry address is in the hash so two
-    ///         registry instances sharing one factory never derive the same salt.
-    function predictWrapperFor(address registry_, address ca, address ref, address caSource, address refSource)
-        external
-        pure
-        returns (address)
-    {
-        return predictWrapper(keccak256(abi.encode(registry_, ca, ref, caSource, refSource)));
     }
 
     // ── IWrapperFactory ────────────────────────────────────────────────────────────
@@ -196,7 +186,7 @@ contract MockWrapperFactory is IWrapperFactory {
                 // Nested deploy records `fixedWrapper` under the nested key (it is this same factory
                 // in Reentrant mode, so it also returns `fixedWrapper`); the outer call then records
                 // the same address under its own key.
-                registry.deploy(reentrantCa, reentrantRef, reentrantMode);
+                registry.deploy(reentrantCa, reentrantRef, reentrantMode, bytes32(0));
             }
             return (fixedWrapper, predictOracle(morphoSalt));
         }

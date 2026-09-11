@@ -59,10 +59,15 @@ contract StateWritingRecipe {
 
     /// @dev NOT `view`. A single `SSTORE`, which is all it takes: `STATICCALL` makes any state write an
     ///      exceptional halt, so this whole function is unreachable through the adapter's call shape.
-    function verify(address, address, address, IMarketRegistry.ResolvedConstraint calldata, bytes calldata)
-        external
-        returns (bool)
-    {
+    function verify(
+        address,
+        address,
+        address,
+        uint256,
+        bool,
+        IMarketRegistry.ResolvedConstraint calldata,
+        bytes calldata
+    ) external returns (bool) {
         writeCount += 1;
         return true;
     }
@@ -168,6 +173,12 @@ contract RecipeTest is RegistryFixture {
     ///      `makeAddr` label would make the `rate()` call revert on an empty return. It stands in for
     ///      the pair's feed wrapper in the `LiquidityPriceRecipe` tests — that recipe only ever reads
     ///      `rate()`, so where the number comes from does not matter to it.
+    /// @dev A market expiry a year out. Neither recipe under test reads it; the argument exists for
+    ///      recipes whose policy is sized by the market's life.
+    function _expiry() internal view returns (uint256) {
+        return block.timestamp + 365 days;
+    }
+
     function _oracleAt(uint256 rate) internal returns (address) {
         return reg.deployFixedRateOracle(rate);
     }
@@ -383,7 +394,8 @@ contract RecipeTest is RegistryFixture {
     ///         one wei is not a tolerance — `rateMin < rateMax` is strict, so a single point is
     ///         uncreatable — and with an oracle that cannot move, a one-wei window is a pinned rate.
     function test_fixedRate_resolve_derivesTheNarrowestCreatableWindow() public {
-        IMarketRegistry.ResolvedConstraint memory c = fixedRecipe.resolve(ca, ref, _oracleAt(FIXED), "");
+        IMarketRegistry.ResolvedConstraint memory c =
+            fixedRecipe.resolve(ca, ref, _oracleAt(FIXED), fixedRecipe.encodeExtraData());
 
         assertEq(c.rateMin, FIXED, "floor is the oracle's rate");
         assertEq(c.rateMax, FIXED + fixedRecipe.WINDOW_WIDTH(), "ceiling is one wei above it");
@@ -404,10 +416,10 @@ contract RecipeTest is RegistryFixture {
         assertEq(high.rateMin, FIXED * 7, "and the second at the second's, from the same recipe");
     }
 
-    function test_fixedRate_resolve_nonEmptyAdditionalData_reverts() public {
+    function test_fixedRate_resolve_nonEmptyExtraData_reverts() public {
         address oracle = _oracleAt(FIXED);
         bytes memory payload = abi.encode(ONE); // 32 bytes: looks plausible, means nothing here
-        vm.expectRevert(abi.encodeWithSelector(FixedRateRecipe.UnexpectedAdditionalData.selector, payload.length));
+        vm.expectRevert(abi.encodeWithSelector(FixedRateRecipe.UnexpectedExtraData.selector, payload.length));
         fixedRecipe.resolve(ca, ref, oracle, payload);
     }
 
@@ -419,13 +431,13 @@ contract RecipeTest is RegistryFixture {
         fixedRecipe.resolve(ca, ref, address(0), "");
 
         vm.expectRevert(abi.encodeWithSelector(FixedRateRecipe.RateOracleNotDeployed.selector, ca, ref));
-        fixedRecipe.verify(ca, ref, address(0), _constraint(FIXED, FIXED + 1, 0, 0), "");
+        fixedRecipe.verify(ca, ref, address(0), _expiry(), true, _constraint(FIXED, FIXED + 1, 0, 0), "");
     }
 
     function test_fixedRate_verify_acceptsItsOwnResolveOutput() public {
         address oracle = _oracleAt(FIXED);
         IMarketRegistry.ResolvedConstraint memory c = fixedRecipe.resolve(ca, ref, oracle, "");
-        assertTrue(fixedRecipe.verify(ca, ref, oracle, c, ""), "resolve's own output must verify");
+        assertTrue(fixedRecipe.verify(ca, ref, oracle, _expiry(), true, c, ""), "resolve's own output must verify");
     }
 
     /// @notice THE PROVENANCE CHECK, which is what replaced the constructor `immutable` as the thing
@@ -439,8 +451,13 @@ contract RecipeTest is RegistryFixture {
         assertTrue(reg.predictFixedRateOracle(FIXED) != impostor, "fixture precondition: at the wrong address");
 
         IMarketRegistry.ResolvedConstraint memory c = _constraint(FIXED, FIXED + 1, 0, 0);
-        assertFalse(fixedRecipe.verify(ca, ref, impostor, c, ""), "an oracle not from the factory is refused");
-        assertTrue(fixedRecipe.verify(ca, ref, _oracleAt(FIXED), c, ""), "and the genuine one at the same rate is not");
+        assertFalse(
+            fixedRecipe.verify(ca, ref, impostor, _expiry(), true, c, ""), "an oracle not from the factory is refused"
+        );
+        assertTrue(
+            fixedRecipe.verify(ca, ref, _oracleAt(FIXED), _expiry(), true, c, ""),
+            "and the genuine one at the same rate is not"
+        );
     }
 
     /// @notice "Fixed" is the two allowances at zero: a window the rate may drift inside is not a fixed
@@ -449,11 +466,25 @@ contract RecipeTest is RegistryFixture {
     function test_fixedRate_verify_rejectsAnythingNotActuallyFixed() public {
         address oracle = _oracleAt(FIXED);
 
-        assertFalse(fixedRecipe.verify(ca, ref, oracle, _constraint(FIXED, FIXED + 1, 1, 0), ""), "daily allowance");
-        assertFalse(fixedRecipe.verify(ca, ref, oracle, _constraint(FIXED, FIXED + 1, 0, 1), ""), "capacity allowance");
-        assertFalse(fixedRecipe.verify(ca, ref, oracle, _constraint(FIXED, FIXED, 0, 0), ""), "collapsed window");
-        assertFalse(fixedRecipe.verify(ca, ref, oracle, _constraint(FIXED + 1, FIXED, 0, 0), ""), "inverted window");
-        assertFalse(fixedRecipe.verify(ca, ref, oracle, _constraint(0, FIXED, 0, 0), ""), "zero rateMin");
+        assertFalse(
+            fixedRecipe.verify(ca, ref, oracle, _expiry(), true, _constraint(FIXED, FIXED + 1, 1, 0), ""),
+            "daily allowance"
+        );
+        assertFalse(
+            fixedRecipe.verify(ca, ref, oracle, _expiry(), true, _constraint(FIXED, FIXED + 1, 0, 1), ""),
+            "capacity allowance"
+        );
+        assertFalse(
+            fixedRecipe.verify(ca, ref, oracle, _expiry(), true, _constraint(FIXED, FIXED, 0, 0), ""),
+            "collapsed window"
+        );
+        assertFalse(
+            fixedRecipe.verify(ca, ref, oracle, _expiry(), true, _constraint(FIXED + 1, FIXED, 0, 0), ""),
+            "inverted window"
+        );
+        assertFalse(
+            fixedRecipe.verify(ca, ref, oracle, _expiry(), true, _constraint(0, FIXED, 0, 0), ""), "zero rateMin"
+        );
     }
 
     /// @notice The window's WIDTH is not the policy — the oracle is. With a rate that cannot move and
@@ -461,16 +492,22 @@ contract RecipeTest is RegistryFixture {
     ///         `verify` accepts one. This is the deliberate looseness noted on the contract.
     function test_fixedRate_verify_acceptsAWiderWindowThanResolveProduces() public {
         address oracle = _oracleAt(FIXED);
-        assertTrue(fixedRecipe.verify(ca, ref, oracle, _constraint(FIXED / 2, FIXED * 2, 0, 0), ""), "width is free");
+        assertTrue(
+            fixedRecipe.verify(ca, ref, oracle, _expiry(), true, _constraint(FIXED / 2, FIXED * 2, 0, 0), ""),
+            "width is free"
+        );
     }
 
     /// @notice `verify` returns FALSE for a payload it cannot use, where `resolve` REVERTS. The
     ///         asymmetry is the interface's rule, not an inconsistency: `resolve` is called off-chain
     ///         by the agent building the order, so a loud failure is a bug report at the moment the
     ///         mistake is made; `verify` runs on-chain and the adapter owns the revert selector.
-    function test_fixedRate_verify_nonEmptyAdditionalData_returnsFalseRatherThanReverting() public {
+    function test_fixedRate_verify_nonEmptyExtraData_returnsFalseRatherThanReverting() public {
         IMarketRegistry.ResolvedConstraint memory c = _constraint(FIXED, FIXED + 1, 0, 0);
-        assertFalse(fixedRecipe.verify(ca, ref, _oracleAt(FIXED), c, abi.encode(ONE)), "carried bytes are a mismatch");
+        assertFalse(
+            fixedRecipe.verify(ca, ref, _oracleAt(FIXED), _expiry(), true, c, abi.encode(ONE)),
+            "carried bytes are a mismatch"
+        );
     }
 
     /// @notice The blockage the predecessor documented is GONE, and this asserts the fix rather than
@@ -486,6 +523,26 @@ contract RecipeTest is RegistryFixture {
         assertLt(c.rateMin, c.rateMax, "phoenix's STRICT rateMin < rateMax");
         assertGe(IRateOracle(oracle).rate(), c.rateMin, "and the live rate sits inside the window,");
         assertLe(IRateOracle(oracle).rate(), c.rateMax, "which is what bootstrap requires at creation");
+    }
+
+    // ─────────────────────── FixedRateRecipe: extraData helpers ───────────────────────
+
+    /// @notice The recipe takes no `extraData`, and it says so through the same helper pair
+    ///         every other recipe exposes, so off-chain tooling never needs a special case for it.
+    function test_fixedRate_encodeExtraData_isEmpty() public view {
+        assertEq(fixedRecipe.encodeExtraData().length, 0, "the expected payload is no payload");
+    }
+
+    function test_fixedRate_decodeExtraData_acceptsEmpty() public view {
+        fixedRecipe.decodeExtraData("");
+    }
+
+    /// @notice The decoder rejects a payload with the same selector `resolve` uses, so a builder
+    ///         who checks the payload up front sees the same error they would see at resolve time.
+    function test_fixedRate_decodeExtraData_nonEmpty_reverts() public {
+        bytes memory payload = abi.encode(ONE);
+        vm.expectRevert(abi.encodeWithSelector(FixedRateRecipe.UnexpectedExtraData.selector, payload.length));
+        fixedRecipe.decodeExtraData(payload);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -606,9 +663,9 @@ contract RecipeTest is RegistryFixture {
     }
 
     /// @notice The live oracle is the preferred anchor. When the agent building the order can name one,
-    ///         the window is derived from the rate it reports and the anchor in `additionalData` is not
+    ///         the window is derived from the rate it reports and the anchor in `extraData` is not
     ///         read at all — so the two disagreeing here must resolve in the oracle's favour.
-    function test_liquidity_resolve_prefersTheLiveOracleOverAdditionalData() public {
+    function test_liquidity_resolve_prefersTheLiveOracleOverExtraData() public {
         address live = _oracleAt(5 * ONE); // five times the anchor the payload claims
         assertEq(IRateOracle(live).rate(), 5 * ONE, "fixture precondition: the oracle disagrees");
 
@@ -623,7 +680,7 @@ contract RecipeTest is RegistryFixture {
     /// @notice "Prefers" means the payload is not read, not that it is read and overridden. Every
     ///         payload that would be REJECTED on the fallback path below is simply ignored once an
     ///         oracle is supplied.
-    function test_liquidity_resolve_withAnOracle_doesNotReadAdditionalDataAtAll() public {
+    function test_liquidity_resolve_withAnOracle_doesNotReadExtraDataAtAll() public {
         address live = _oracleAt(5 * ONE);
         uint256 expected = 10 * ONE;
 
@@ -635,10 +692,11 @@ contract RecipeTest is RegistryFixture {
 
     /// @notice The fallback exists for one case: the FIRST order ever written against a pair, signed
     ///         before the adapter's step 3 has deployed the feed wrapper. There is no oracle to read
-    ///         then, so the anchor travels in `additionalData` instead — and a `resolve` that insisted
+    ///         then, so the anchor travels in `extraData` instead — and a `resolve` that insisted
     ///         on an oracle would be unusable for exactly the order that creates the market.
-    function test_liquidity_resolve_fallsBackToAdditionalDataWhenNoOracleIsSupplied() public view {
-        IMarketRegistry.ResolvedConstraint memory c = liquidity.resolve(ca, ref, address(0), abi.encode(2 * ONE));
+    function test_liquidity_resolve_fallsBackToExtraDataWhenNoOracleIsSupplied() public view {
+        IMarketRegistry.ResolvedConstraint memory c =
+            liquidity.resolve(ca, ref, address(0), liquidity.encodeExtraData(2 * ONE));
 
         assertEq(c.rateMin, 1, "floor");
         assertEq(c.rateMax, 4 * ONE, "the window comes from the payload's anchor");
@@ -659,12 +717,12 @@ contract RecipeTest is RegistryFixture {
         assertFalse(ok, "a non-zero oracle is read, not second-guessed");
     }
 
-    function test_liquidity_resolve_malformedAdditionalData_reverts() public {
-        vm.expectRevert(abi.encodeWithSelector(BaseLiquidityRecipe.MalformedAdditionalData.selector, 0));
+    function test_liquidity_resolve_malformedExtraData_reverts() public {
+        vm.expectRevert(abi.encodeWithSelector(BaseLiquidityRecipe.MalformedExtraData.selector, 0));
         liquidity.resolve(ca, ref, address(0), "");
 
         bytes memory twoWords = abi.encode(ONE, ONE);
-        vm.expectRevert(abi.encodeWithSelector(BaseLiquidityRecipe.MalformedAdditionalData.selector, twoWords.length));
+        vm.expectRevert(abi.encodeWithSelector(BaseLiquidityRecipe.MalformedExtraData.selector, twoWords.length));
         liquidity.resolve(ca, ref, address(0), twoWords);
     }
 
@@ -688,6 +746,58 @@ contract RecipeTest is RegistryFixture {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
+    // 4b. Liquidity recipes — extraData helpers
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// @notice `encodeExtraData` then `decodeExtraData` returns the anchor unchanged on both subclasses.
+    function test_liquidity_extraData_roundTripsOnBothRecipes() public {
+        LiquidityNavRecipe nav = new LiquidityNavRecipe();
+        nav.initialize(iReg);
+
+        uint256[4] memory anchors = [uint256(1), ONE, 2 * ONE, type(uint256).max];
+        for (uint256 i = 0; i < anchors.length; i++) {
+            assertEq(liquidity.decodeExtraData(liquidity.encodeExtraData(anchors[i])), anchors[i], "price round trip");
+            assertEq(nav.decodeExtraData(nav.encodeExtraData(anchors[i])), anchors[i], "nav round trip");
+        }
+    }
+
+    /// @notice The helper is a convenience, not a new layout: what it returns is exactly the one ABI
+    ///         word `resolve` has always read, so payloads built either way stay interchangeable.
+    function test_liquidity_encodeExtraData_isPlainAbiEncode() public view {
+        assertEq(liquidity.encodeExtraData(ONE), abi.encode(ONE), "one");
+        assertEq(liquidity.encodeExtraData(0), abi.encode(uint256(0)), "zero");
+        assertEq(liquidity.encodeExtraData(type(uint256).max), abi.encode(type(uint256).max), "max");
+        assertEq(liquidity.encodeExtraData(ONE).length, 32, "exactly one ABI word");
+    }
+
+    /// @notice The helper and `resolve` share one decoder, so a payload the helper rejects is rejected
+    ///         with the same error, and the same length, that `resolve` would report.
+    function test_liquidity_decodeExtraData_malformed_revertsLikeResolve() public {
+        vm.expectRevert(abi.encodeWithSelector(BaseLiquidityRecipe.MalformedExtraData.selector, 0));
+        liquidity.decodeExtraData("");
+
+        bytes memory twoWords = abi.encode(ONE, ONE);
+        vm.expectRevert(abi.encodeWithSelector(BaseLiquidityRecipe.MalformedExtraData.selector, twoWords.length));
+        liquidity.decodeExtraData(twoWords);
+
+        bytes memory short = hex"01";
+        vm.expectRevert(abi.encodeWithSelector(BaseLiquidityRecipe.MalformedExtraData.selector, short.length));
+        liquidity.decodeExtraData(short);
+    }
+
+    /// @notice A payload that decodes through the helper is a payload `resolve` accepts, and it lands on
+    ///         the same anchor: the fallback window is derived from exactly what the helper read.
+    function test_liquidity_decodeExtraData_agreesWithResolve() public view {
+        bytes memory payload = liquidity.encodeExtraData(3 * ONE);
+        uint256 anchor = liquidity.decodeExtraData(payload);
+        IMarketRegistry.ResolvedConstraint memory c = liquidity.resolve(ca, ref, address(0), payload);
+
+        assertEq(anchor, 3 * ONE, "decoded anchor");
+        assertEq(c.rateChangePerDayMax, anchor, "resolve anchored on what the helper decoded");
+        assertEq(c.rateMax, 2 * anchor, "and the window follows it");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
     // 5. LiquidityPriceRecipe — verify
     // ═══════════════════════════════════════════════════════════════════════════
 
@@ -695,7 +805,7 @@ contract RecipeTest is RegistryFixture {
         address oracle = _oracleAt(ONE);
         IMarketRegistry.ResolvedConstraint memory c = liquidity.resolve(ca, ref, oracle, "");
 
-        assertTrue(liquidity.verify(ca, ref, oracle, c, ""), "resolve's own output must verify");
+        assertTrue(liquidity.verify(ca, ref, oracle, _expiry(), true, c, ""), "resolve's own output must verify");
     }
 
     /// @notice THE LIVE RATE IS A BOUND, NOT THE ANCHOR, and this test is the first half of what that
@@ -706,9 +816,11 @@ contract RecipeTest is RegistryFixture {
         IMarketRegistry.ResolvedConstraint memory c = liquidity.resolve(ca, ref, _oracleAt(ONE), "");
         assertEq(c.rateMax, 2 * ONE, "precondition: the window is [1 wei, 2.0]");
 
-        assertTrue(liquidity.verify(ca, ref, _oracleAt(1.5e18), c, ""), "50% up and still filling");
-        assertTrue(liquidity.verify(ca, ref, _oracleAt(0.01e18), c, ""), "99% down and still filling");
-        assertTrue(liquidity.verify(ca, ref, _oracleAt(2 * ONE - 1), c, ""), "one wei below the ceiling");
+        assertTrue(liquidity.verify(ca, ref, _oracleAt(1.5e18), _expiry(), true, c, ""), "50% up and still filling");
+        assertTrue(liquidity.verify(ca, ref, _oracleAt(0.01e18), _expiry(), true, c, ""), "99% down and still filling");
+        assertTrue(
+            liquidity.verify(ca, ref, _oracleAt(2 * ONE - 1), _expiry(), true, c, ""), "one wei below the ceiling"
+        );
     }
 
     /// @notice The second half: once the live rate leaves the window the order stops filling. This is
@@ -717,10 +829,14 @@ contract RecipeTest is RegistryFixture {
     function test_liquidity_verify_rejectsALiveRateOutsideTheWindow() public {
         IMarketRegistry.ResolvedConstraint memory c = liquidity.resolve(ca, ref, _oracleAt(ONE), "");
 
-        assertFalse(liquidity.verify(ca, ref, _oracleAt(2 * ONE), c, ""), "exactly on the ceiling: excluded");
-        assertFalse(liquidity.verify(ca, ref, _oracleAt(2 * ONE + 1), c, ""), "one wei above the ceiling");
-        assertFalse(liquidity.verify(ca, ref, _oracleAt(1000 * ONE), c, ""), "a thousand times over");
-        assertFalse(liquidity.verify(ca, ref, _oracleAt(1), c, ""), "exactly on the floor: excluded");
+        assertFalse(
+            liquidity.verify(ca, ref, _oracleAt(2 * ONE), _expiry(), true, c, ""), "exactly on the ceiling: excluded"
+        );
+        assertFalse(
+            liquidity.verify(ca, ref, _oracleAt(2 * ONE + 1), _expiry(), true, c, ""), "one wei above the ceiling"
+        );
+        assertFalse(liquidity.verify(ca, ref, _oracleAt(1000 * ONE), _expiry(), true, c, ""), "a thousand times over");
+        assertFalse(liquidity.verify(ca, ref, _oracleAt(1), _expiry(), true, c, ""), "exactly on the floor: excluded");
     }
 
     /// @notice THE BOUND IS ONE-SIDED, asserted here rather than left to be discovered. Containment
@@ -735,12 +851,16 @@ contract RecipeTest is RegistryFixture {
         IMarketRegistry.ResolvedConstraint memory tooSmall =
             liquidity.resolve(ca, ref, address(0), abi.encode(0.5e18 - 1));
         assertLt(tooSmall.rateMax, ONE, "precondition: the ceiling sits below the live rate");
-        assertFalse(liquidity.verify(ca, ref, oracle, tooSmall, ""), "so the market is outside its own window");
+        assertFalse(
+            liquidity.verify(ca, ref, oracle, _expiry(), true, tooSmall, ""), "so the market is outside its own window"
+        );
 
         IMarketRegistry.ResolvedConstraint memory tooLarge =
             liquidity.resolve(ca, ref, address(0), abi.encode(1000 * ONE));
         assertEq(tooLarge.rateMax, 2000 * ONE, "a window a thousand times wider than it needs to be");
-        assertTrue(liquidity.verify(ca, ref, oracle, tooLarge, ""), "and the 1 wei floor lets it through");
+        assertTrue(
+            liquidity.verify(ca, ref, oracle, _expiry(), true, tooLarge, ""), "and the 1 wei floor lets it through"
+        );
     }
 
     /// @notice `verify` is handed no anchor at all now, so it reads one back out of the constraint:
@@ -757,9 +877,11 @@ contract RecipeTest is RegistryFixture {
         IMarketRegistry.ResolvedConstraint memory mixed =
             _constraint(b.rateMin, b.rateMax, a.rateChangePerDayMax, a.rateChangeCapacityMax);
 
-        assertTrue(liquidity.verify(ca, ref, oracle, a, ""), "A alone verifies");
-        assertTrue(liquidity.verify(ca, ref, oracle, b, ""), "B alone verifies");
-        assertFalse(liquidity.verify(ca, ref, oracle, mixed, ""), "B's window with A's allowances does not");
+        assertTrue(liquidity.verify(ca, ref, oracle, _expiry(), true, a, ""), "A alone verifies");
+        assertTrue(liquidity.verify(ca, ref, oracle, _expiry(), true, b, ""), "B alone verifies");
+        assertFalse(
+            liquidity.verify(ca, ref, oracle, _expiry(), true, mixed, ""), "B's window with A's allowances does not"
+        );
     }
 
     /// @notice The shape is checked on all FOUR fields, not just the window. Tampering with either
@@ -773,8 +895,8 @@ contract RecipeTest is RegistryFixture {
         IMarketRegistry.ResolvedConstraint memory capacity =
             _constraint(c.rateMin, c.rateMax, c.rateChangePerDayMax, c.rateChangeCapacityMax + 1);
 
-        assertFalse(liquidity.verify(ca, ref, oracle, perDay, ""), "widened daily allowance");
-        assertFalse(liquidity.verify(ca, ref, oracle, capacity, ""), "widened capacity");
+        assertFalse(liquidity.verify(ca, ref, oracle, _expiry(), true, perDay, ""), "widened daily allowance");
+        assertFalse(liquidity.verify(ca, ref, oracle, _expiry(), true, capacity, ""), "widened capacity");
     }
 
     /// @notice The interface's rule about reverting, and the one place this recipe uses it: `false`
@@ -788,21 +910,27 @@ contract RecipeTest is RegistryFixture {
         IMarketRegistry.ResolvedConstraint memory c = liquidity.resolve(ca, ref, address(0), abi.encode(ONE));
 
         vm.expectRevert(abi.encodeWithSelector(BaseLiquidityRecipe.RateOracleNotDeployed.selector, ca, ref));
-        liquidity.verify(ca, ref, address(0), c, "");
+        liquidity.verify(ca, ref, address(0), _expiry(), true, c, "");
     }
 
-    /// @notice `verify` reads no `additionalData` whatsoever. The oracle is live by the time this runs,
+    /// @notice `verify` reads no `extraData` whatsoever. The oracle is live by the time this runs,
     ///         so the order's own account of the rate adds nothing but a way to lie — and an order signed
     ///         through `resolve`'s fallback path still carries its anchor, so rejecting a non-empty
     ///         payload would refuse exactly the orders that created their own markets.
-    function test_liquidity_verify_ignoresAdditionalDataEntirely() public {
+    function test_liquidity_verify_ignoresExtraDataEntirely() public {
         address oracle = _oracleAt(ONE);
         IMarketRegistry.ResolvedConstraint memory c = liquidity.resolve(ca, ref, oracle, "");
 
-        assertTrue(liquidity.verify(ca, ref, oracle, c, ""), "empty");
-        assertTrue(liquidity.verify(ca, ref, oracle, c, abi.encode(ONE)), "the anchor it was signed with");
-        assertTrue(liquidity.verify(ca, ref, oracle, c, abi.encode(1000 * ONE)), "an anchor it was not");
-        assertTrue(liquidity.verify(ca, ref, oracle, c, hex"c0ffee"), "bytes that are not a word at all");
+        assertTrue(liquidity.verify(ca, ref, oracle, _expiry(), true, c, ""), "empty");
+        assertTrue(
+            liquidity.verify(ca, ref, oracle, _expiry(), true, c, abi.encode(ONE)), "the anchor it was signed with"
+        );
+        assertTrue(
+            liquidity.verify(ca, ref, oracle, _expiry(), true, c, abi.encode(1000 * ONE)), "an anchor it was not"
+        );
+        assertTrue(
+            liquidity.verify(ca, ref, oracle, _expiry(), true, c, hex"c0ffee"), "bytes that are not a word at all"
+        );
     }
 
     /// @notice Phoenix's two constraint requirements are checked here, so a structurally impossible
@@ -812,9 +940,13 @@ contract RecipeTest is RegistryFixture {
     function test_liquidity_verify_rejectsAStructurallyImpossibleConstraint() public {
         address oracle = _oracleAt(ONE);
 
-        assertFalse(liquidity.verify(ca, ref, oracle, _constraint(0, ONE, 0, 0), ""), "zero rateMin");
-        assertFalse(liquidity.verify(ca, ref, oracle, _constraint(2 * ONE, ONE, 0, 0), ""), "inverted window");
-        assertFalse(liquidity.verify(ca, ref, oracle, _constraint(ONE, ONE, 0, 0), ""), "single-point window");
+        assertFalse(liquidity.verify(ca, ref, oracle, _expiry(), true, _constraint(0, ONE, 0, 0), ""), "zero rateMin");
+        assertFalse(
+            liquidity.verify(ca, ref, oracle, _expiry(), true, _constraint(2 * ONE, ONE, 0, 0), ""), "inverted window"
+        );
+        assertFalse(
+            liquidity.verify(ca, ref, oracle, _expiry(), true, _constraint(ONE, ONE, 0, 0), ""), "single-point window"
+        );
     }
 
     /// @notice The property `verify` is built on, fuzzed: given a constraint this recipe produced, the
@@ -830,7 +962,7 @@ contract RecipeTest is RegistryFixture {
         assertEq(c.rateMax, 2 * anchor, "the ceiling is twice the anchor at every anchor");
 
         assertEq(
-            liquidity.verify(ca, ref, _oracleAt(live), c, ""),
+            liquidity.verify(ca, ref, _oracleAt(live), _expiry(), true, c, ""),
             live > c.rateMin && live < c.rateMax,
             "the verdict IS window containment, at every anchor and every live rate"
         );
@@ -847,11 +979,15 @@ contract RecipeTest is RegistryFixture {
         assertEq(c.rateChangePerDayMax, anchor, "the daily allowance IS the anchor");
 
         address oracle = _oracleAt(anchor);
-        assertTrue(liquidity.verify(ca, ref, oracle, c, ""), "precondition: the untouched constraint verifies");
+        assertTrue(
+            liquidity.verify(ca, ref, oracle, _expiry(), true, c, ""), "precondition: the untouched constraint verifies"
+        );
 
         IMarketRegistry.ResolvedConstraint memory nudged =
             _constraint(c.rateMin, c.rateMax, c.rateChangePerDayMax + 1, c.rateChangeCapacityMax);
-        assertFalse(liquidity.verify(ca, ref, oracle, nudged, ""), "a one wei nudge breaks the agreement");
+        assertFalse(
+            liquidity.verify(ca, ref, oracle, _expiry(), true, nudged, ""), "a one wei nudge breaks the agreement"
+        );
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -874,9 +1010,9 @@ contract RecipeTest is RegistryFixture {
     ///      2. **The call must be a real low-level `staticcall`.** `IMarketRecipe(hostile).verify(...)`
     ///         would be compiled from the INTERFACE's `view` marking, so solc would emit the
     ///         `STATICCALL` for its own reasons and the test would be checking the compiler rather than
-    ///         the guarantee. `CorkLimitOrderAdapter._verifyConstraint` writes the `staticcall`
-    ///         explicitly, with `abi.encodeCall(IMarketRecipe.verify, ...)`, and this test uses exactly
-    ///         that shape.
+    ///         the guarantee. `CorkLimitOrderAdapter._verifyConstraint` makes a typed call inside a
+    ///         `view` function, which solc compiles to `STATICCALL`; this test reproduces that shape
+    ///         with an explicit `staticcall` over `abi.encodeCall(IMarketRecipe.verify, ...)`.
     ///      3. **There must be a positive control.** A failing `staticcall` on its own proves nothing —
     ///         a wrong selector, a mis-encoded argument or a missing function would fail identically
     ///         and the test would pass for the wrong reason. So the same calldata is first sent as an
@@ -892,8 +1028,9 @@ contract RecipeTest is RegistryFixture {
         _addRecipe(address(hostile));
         assertTrue(iReg.isRecipe(address(hostile)), "the registry approves it on code length alone");
 
-        bytes memory callData =
-            abi.encodeCall(IMarketRecipe.verify, (ca, ref, address(0), _constraint(ONE, 2 * ONE, 0, 0), bytes("")));
+        bytes memory callData = abi.encodeCall(
+            IMarketRecipe.verify, (ca, ref, address(0), _expiry(), true, _constraint(ONE, 2 * ONE, 0, 0), bytes(""))
+        );
 
         // Positive control: as an ordinary CALL this calldata reaches the function, is accepted, and
         // the write lands. Without this, the negative result below would be indistinguishable from a
@@ -917,14 +1054,14 @@ contract RecipeTest is RegistryFixture {
         address oracle = _oracleAt(ONE);
         IMarketRegistry.ResolvedConstraint memory c = liquidity.resolve(ca, ref, address(0), abi.encode(ONE));
 
-        (bool okLiquidity, bytes memory liquidityRet) =
-            address(liquidity).staticcall(abi.encodeCall(IMarketRecipe.verify, (ca, ref, oracle, c, abi.encode(ONE))));
+        (bool okLiquidity, bytes memory liquidityRet) = address(liquidity)
+            .staticcall(abi.encodeCall(IMarketRecipe.verify, (ca, ref, oracle, _expiry(), true, c, abi.encode(ONE))));
         assertTrue(okLiquidity, "LiquidityPriceRecipe.verify must survive a staticcall");
         assertTrue(abi.decode(liquidityRet, (bool)), "and accept its own constraint");
 
         IMarketRegistry.ResolvedConstraint memory f = fixedRecipe.resolve(ca, ref, oracle, "");
-        (bool okFixed, bytes memory fixedRet) =
-            address(fixedRecipe).staticcall(abi.encodeCall(IMarketRecipe.verify, (ca, ref, oracle, f, bytes(""))));
+        (bool okFixed, bytes memory fixedRet) = address(fixedRecipe)
+            .staticcall(abi.encodeCall(IMarketRecipe.verify, (ca, ref, oracle, _expiry(), true, f, bytes(""))));
         assertTrue(okFixed, "FixedRateRecipe.verify must survive a staticcall");
         assertTrue(abi.decode(fixedRet, (bool)), "and accept its own constraint");
     }

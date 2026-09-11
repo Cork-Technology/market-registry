@@ -83,9 +83,9 @@ interface IMarketRegistry {
     ///      yield-bearing vault against native US-Dollar-Coin, which is the main thing net-asset-value
     ///      pricing was wanted for.
     ///
-    ///      The fallback is not silent. The resolved source ADDRESSES go into the wrapper salt and
-    ///      the wrapper mapping key, so which source each leg actually used is recorded on-chain and
-    ///      recoverable through `lookupWrapper`.
+    ///      The fallback is not silent. The resolved source lands in the leg's wiring, which the
+    ///      wrapper key and salt are derived from, and `MarketOracleDeployed` names it, so which
+    ///      source each leg actually used is recorded on-chain.
     enum OracleMode {
         PRICE,
         NAV
@@ -98,7 +98,8 @@ interface IMarketRegistry {
         address addr; // the aggregator (AGGREGATOR_V3) or the ERC-4626 vault (NAV); 0 means absent
         SourceType sourceType; // what it measures; must match the field it is written to
         SourceInterface sourceInterface; // how it is read; sets the hop budget (1 feed / 2 vault)
-        string denomination; // REGISTERED denomination label this source quotes in; the path's start node
+        address denomination; // REGISTERED unit this source quotes in (a token or a Chainlink `Denominations`
+        // pseudo-address); the conversion path's start node
     }
 
     /// @notice An approved token and the structural facts needed to read its value.
@@ -112,17 +113,12 @@ interface IMarketRegistry {
 
     /// @notice An approved conversion feed for a (base, quote) address pair — one edge of the
     ///         denomination hop graph.
+    /// @dev The feed's decimals are not stored. Nothing on-chain needs them here: the Morpho oracle
+    ///      constructor reads the aggregator's `decimals()` live at deploy time.
     struct ConversionFeed {
         address base; // token (or Denominations pseudo-address) the feed reports on
         address quote; // token (or Denominations pseudo-address) the value is in
         address aggregatorAddress; // on-chain aggregator address; re-read live at verify
-        uint8 feedDecimals; // the feed's own decimals(); re-read on-chain
-    }
-
-    /// @notice One registered denomination: the label hash and the unit address that label names.
-    struct Denomination {
-        bytes32 labelHash; // `keccak256(bytes(label))` — the storage key, exact bytes and case-sensitive
-        address unit; // the unit address the label names; never zero for a registered label
     }
 
     /// @notice A rate constraint as four concrete rate quantities — what a recipe resolves to.
@@ -142,12 +138,18 @@ interface IMarketRegistry {
     // can rebuild the asset, conversion-feed, recipe and denomination stores exactly, with no
     // `eth_call` anywhere. Nothing the owner writes is visible only through a view function.
     //
-    // Two things sit outside this pair, and both carry their own event so the "no `eth_call` anywhere"
-    // promise survives. The wrapper record, which `deploy` writes permissionlessly rather than the
-    // owner: `MarketOracleDeployed` carries it, and carries the two resolved source addresses its key
-    // is built from. And the market bound, which is a scalar setting rather than a store and so has
-    // no natural key to hash: `MaxExpiryDurationUpdated` carries it, constructor included, so its
-    // starting value is in the log too.
+    // Two things sit outside this pair. The market bound is a scalar setting rather than a store and
+    // so has no natural key to hash: `MaxExpiryDurationUpdated` carries it, constructor included, so
+    // its starting value is in the log too, and the "no `eth_call` anywhere" promise holds for it.
+    //
+    // The wrapper record is the one exception to that promise. `deploy` writes it permissionlessly
+    // rather than the owner, and `MarketOracleDeployed` carries the wrapper, the pair and the mode it
+    // answers for, and the two resolved source addresses — so an indexer can replay the full HISTORY
+    // of wrappers built for a `(pair, mode)`. What it cannot do is say which of them `deploy` serves
+    // today: the storage key folds in the live wiring (denomination, bridge path, `decimals()` reads),
+    // so one `(pair, mode)` can emit several deploy events over time, and the registry serves
+    // whichever key matches the wiring in force now. The live answer needs a view call —
+    // `lookupWrapper` or `wrapperKey`.
     //
     // Two things make that work, and the earlier hash-only pair had neither:
     //
@@ -172,16 +174,16 @@ interface IMarketRegistry {
     ///      | `Asset`          | `keccak256(abi.encode(addr))`       | `abi.encode(Asset)`          |
     ///      | `ConversionFeed` | `keccak256(abi.encode(base,quote))` | `abi.encode(ConversionFeed)` |
     ///      | `Recipe`         | `keccak256(abi.encode(recipe))`     | `abi.encode(address)`        |
-    ///      | `Denomination`   | `keccak256(bytes(label))`           | `abi.encode(string,address)` |
+    ///      | `Denomination`   | `bytes32(uint256(uint160(unit)))`   | `abi.encode(address)`        |
     ///
     ///      The asset payload is what makes the NAME index replayable: `_assetByName` is keyed on a
-    ///      case-folded hash of the name, and the name only ever appears here. The denomination
-    ///      payload matters for the same reason — these payloads are the only place a label's text
-    ///      survives on-chain at all, since the store keeps hashes and `getDenominations` answers in
-    ///      hashes.
+    ///      case-folded hash of the name, and the name only ever appears here. A denomination is
+    ///      nothing but its unit address, so its key is that address left-padded to 32 bytes — not
+    ///      hashed — and the payload repeats it so every namespace decodes the same way.
     /// @param namespace The store the entry belongs to.
     /// @param keyHash The store's key for this entry. For the recipe store this addresses nothing —
     ///        that store is keyed by the raw address — and exists so the topic layout is uniform.
+    ///        For the denomination store it is the unit address itself, widened to 32 bytes.
     /// @param entry The record, ABI-encoded per the table above.
     event EntryAdded(Namespace indexed namespace, bytes32 indexed keyHash, bytes entry);
 
@@ -195,10 +197,10 @@ interface IMarketRegistry {
     ///      | `Asset`          | `abi.encode(address)`          |
     ///      | `ConversionFeed` | `abi.encode(address,address)`  |
     ///      | `Recipe`         | `abi.encode(address)`          |
-    ///      | `Denomination`   | `abi.encode(string)`           |
+    ///      | `Denomination`   | `abi.encode(address)`          |
     ///
-    ///      Re-pointing is still two events. A label or asset corrected in place shows up as a
-    ///      removal followed by an add, never as a second add quietly overwriting the first.
+    ///      Editing is still two events. An asset corrected in place shows up as a removal followed
+    ///      by an add, never as a second add quietly overwriting the first.
     /// @param namespace The store the entry belonged to.
     /// @param keyHash The store's key for the removed entry.
     /// @param key The natural key, ABI-encoded per the table above.
@@ -209,14 +211,14 @@ interface IMarketRegistry {
     /// @dev Emitted only on a fresh deploy. A repeat `deploy` for an already-recorded key returns
     ///      the stored wrapper without emitting or changing state (idempotent).
     ///
-    ///      The three trailing fields are what make the wrapper record reproducible off-chain. The
-    ///      wrapper is stored under `keccak256(abi.encode(registry, ca, ref, caSource, refSource))` —
-    ///      the emitting registry's address is part of the key, so an indexer folding logs from more
-    ///      than one registry must key by emitter — and those
-    ///      two source addresses are resolved at deploy time — in NAV mode a leg falls back to its
-    ///      price source when it has none of its own. Emitting them records which source each leg
-    ///      actually used, and `mode` records what was asked for, so a NAV wrapper and a price
-    ///      wrapper for the same pair are no longer indistinguishable in the log.
+    ///      An indexer keys the wrapper record by `(emitter, ca, ref, mode)`: the emitting registry's
+    ///      address must be part of it, because two registries sharing one factory each keep their own
+    ///      record. The registry's own storage key is `wrapperKey(ca, ref, mode)`, which folds in the
+    ///      fully resolved wiring — including live `decimals()` reads — and is therefore a view, not
+    ///      something to rebuild from the log. The two source addresses are resolved at deploy time —
+    ///      in NAV mode a leg falls back to its price source when it has none of its own. Emitting
+    ///      them records which source each leg actually used, and `mode` records what was asked for,
+    ///      so a NAV wrapper and a price wrapper for the same pair are distinguishable in the log.
     /// @param ca The collateral asset the oracle was deployed for.
     /// @param ref The reference asset the oracle prices against.
     /// @param wrapper The rate-oracle (`WrapperRateConsumer`) address the factory returned.
@@ -270,9 +272,8 @@ interface IMarketRegistry {
     error EntryNotFound();
 
     /// @notice Two parallel array arguments were not the same length.
-    /// @dev Only the calls whose key and payload arrive as separate arrays can raise this:
-    ///      `removeConversionFeeds` (bases against quotes) and `addDenominations` (labels against
-    ///      units).
+    /// @dev Only a call whose key arrives as two separate arrays can raise this:
+    ///      `removeConversionFeeds` (bases against quotes).
     error ArrayLengthMismatch();
 
     /// @notice A structural check failed: an address field was the zero address — or the factory
@@ -282,9 +283,9 @@ interface IMarketRegistry {
     /// @notice A structural check failed: a required name was empty.
     error EmptyName();
 
-    /// @notice A denomination LABEL is not in the denomination registry.
-    /// @param label The label that is not registered, byte-for-byte as supplied.
-    error UnregisteredDenomination(string label);
+    /// @notice A source's denomination unit is not in the denomination set.
+    /// @param unit The unit address that is not registered.
+    error UnregisteredDenomination(address unit);
 
     /// @notice No chain of approved conversion feeds carries `fromUnit` to US Dollars within
     ///         `maxHops`.
@@ -333,8 +334,13 @@ interface IMarketRegistry {
     /// @param ref The reference asset (base slot).
     /// @param mode Which kind of rate oracle to build; the caller derives this from its recipe's
     ///        `IMarketRecipe.source()`.
+    /// @param oracleSalt Caller-chosen entropy mixed into the CREATE2 salt of the wrapper and its Morpho
+    ///        oracle. It has no part in the wrapper key: it matters only on the call that first builds
+    ///        the pair, and every later call for the pair returns the recorded wrapper whatever salt it
+    ///        carries. Zero is fine. It exists so that nobody can brick a pair by spending its CREATE2
+    ///        salt ahead of time — the caller picks a different salt and the pair deploys.
     /// @return wrapper The rate-oracle (`WrapperRateConsumer`) address for this pair and mode.
-    function deploy(address ca, address ref, OracleMode mode) external returns (address wrapper);
+    function deploy(address ca, address ref, OracleMode mode, bytes32 oracleSalt) external returns (address wrapper);
 
     /// @notice Deploy a `FixedRateOracle` for `rate` through the registry's immutable fixed-rate oracle
     ///         factory, and return its address.
@@ -422,32 +428,31 @@ interface IMarketRegistry {
     /// @notice Remove approved conversion feeds by their (base, quote) pairs.
     /// @dev Owner-only. Missing key reverts `EntryNotFound`; mismatched array lengths revert
     ///      `ArrayLengthMismatch`. No cascade: an asset whose source `denomination` reached US Dollars
-    ///      only through a removed edge keeps its stored entry and starts failing at `deploy`.
-    ///      Removing an edge the live assets depend on is a governance action with teeth, not a
-    ///      cleanup.
+    ///      only through a removed edge keeps its stored entry and starts failing at `deploy` —
+    ///      including for a pair that was deployed before, because the wrapper record is keyed on the
+    ///      wiring and is not consulted until the path has resolved. Removing an edge the live assets
+    ///      depend on is a governance action with teeth, not a cleanup.
     /// @param bases The feeds' base addresses.
     /// @param quotes The feeds' quote addresses, positionally paired with `bases`.
     function removeConversionFeeds(address[] calldata bases, address[] calldata quotes) external;
 
-    /// @notice Register denomination labels against the unit addresses they name.
-    /// @dev Owner-only. A label already registered reverts `EntryAlreadyExists` — this path never
-    ///      overwrites, so correcting a label's unit is `removeDenominations` then `addDenominations`.
-    ///      Empty label reverts `EmptyName`, zero unit reverts `ZeroAddress`, and mismatched array
-    ///      lengths revert `ArrayLengthMismatch`.
-    /// @param labels The denomination labels, matched by exact bytes (case-sensitive).
-    /// @param units The unit addresses the labels name, positionally paired with `labels`: a token
-    ///        address, or a Chainlink `Denominations` pseudo-address for a denomination with no token
-    ///        of its own.
-    function addDenominations(string[] calldata labels, address[] calldata units) external;
+    /// @notice Register denomination units — the set of units a source may quote in, and the
+    ///         candidates the two-hop bridge search walks.
+    /// @dev Owner-only. A unit already registered reverts `EntryAlreadyExists`; a zero unit reverts
+    ///      `ZeroAddress`.
+    /// @param units The unit addresses to register: a token address, or a Chainlink `Denominations`
+    ///        pseudo-address for a denomination with no token of its own.
+    function addDenominations(address[] calldata units) external;
 
-    /// @notice Remove denomination labels.
-    /// @dev Owner-only. Missing label reverts `EntryNotFound`. No cascade, and teeth of its own: an
-    ///      asset whose source still names a removed label keeps its stored entry and starts failing
-    ///      at `deploy` with `UnregisteredDenomination`. Removing a label also shortens the candidate
+    /// @notice Remove denomination units.
+    /// @dev Owner-only. A unit that is not registered reverts `EntryNotFound`. No cascade, and teeth
+    ///      of its own: an asset whose source still quotes a removed unit keeps its stored entry and
+    ///      starts failing at `deploy` with `UnregisteredDenomination`, whether or not the pair was
+    ///      deployed before — see `removeConversionFeeds`. Removing a unit also shortens the candidate
     ///      list `MarketRegistryLib.resolvePath` walks, so a two-hop path that bridged through it
     ///      stops resolving.
-    /// @param labels The denomination labels to remove, matched by exact bytes.
-    function removeDenominations(string[] calldata labels) external;
+    /// @param units The unit addresses to remove.
+    function removeDenominations(address[] calldata units) external;
 
     /// @notice Approve recipe contracts.
     /// @dev Owner-only. Reverts `ZeroAddress` on a zero address, `RecipeNotContract` on an address
@@ -492,15 +497,42 @@ interface IMarketRegistry {
         view
         returns (bool found, ConversionFeed memory entry);
 
-    /// @notice Look up the unit address a denomination label names.
-    /// @dev The point read for the denomination store. `getDenominations` enumerates it but answers in
-    ///      hashes, so this is the only way to ask about a label you hold as a string.
-    /// @param label The denomination label, matched by exact bytes (case-sensitive).
-    /// @return found True if the label is registered.
-    /// @return unit The unit address the label names, or `address(0)` if not found.
-    function lookupDenomination(string calldata label) external view returns (bool found, address unit);
+    /// @notice Whether a unit address is a registered denomination.
+    /// @dev One storage read. This is the same test `addAssets` and `deploy` apply to every present
+    ///      source's `denomination`.
+    /// @param unit The unit address to test.
+    /// @return True if the unit is registered.
+    function isDenomination(address unit) external view returns (bool);
 
-    /// @notice The wrapper `deploy(ca, ref, mode)` would return, or the zero address if there is none.
+    /// @notice The key `deploy(ca, ref, mode, anySalt)` records its wrapper under, and the value it mixes
+    ///         the caller's `oracleSalt` into to get the factory salt.
+    /// @dev `keccak256(abi.encode(registry, ca, ref, mode, base, quote))`, where `base` and `quote` are
+    ///      the reference and collateral legs fully resolved to what the factory is handed: each a
+    ///      `(vault, sample, feed1, feed2, tokenDecimals)` tuple. Because the key is derived from the
+    ///      wiring rather than from the stored sources, it changes whenever a governance edit changes
+    ///      what the factory would be given for this pair — a re-pointed feed, a removed denomination,
+    ///      a token whose `decimals()` moved — and a wrapper is only ever served for the wiring it was
+    ///      built with.
+    ///
+    ///      Reverts for every reason `deploy` would: `EntryNotFound` for an unregistered asset,
+    ///      `MissingSource` for a leg that cannot serve the mode, `NavModeWithoutNavSource`,
+    ///      `UnregisteredDenomination`, `NoConversionPathToUsd`, and whatever a token's `decimals()`
+    ///      reverts with. Use `lookupWrapper` for a read that must not revert.
+    /// @param ca The collateral asset.
+    /// @param ref The reference asset.
+    /// @param mode The oracle mode the wrapper is or would be built for.
+    /// @return The wrapper key for this pair and mode, as of the current stores. The factory salt
+    ///         for a given `oracleSalt` is `keccak256(abi.encode(key, oracleSalt))`.
+    function wrapperKey(address ca, address ref, OracleMode mode) external view returns (bytes32);
+
+    /// @notice The wrapper `deploy(ca, ref, mode, anySalt)` would return, or the zero address if there is none.
+    /// @dev Never reverts. Anything that would make `wrapperKey` revert reads as the zero address
+    ///      here, because "no wrapper can exist for that" and "not deployed yet" are the same answer.
+    ///
+    ///      That includes running out of gas: the key is derived through a self-call, so a caller
+    ///      that sends too little gas for it reads zero as well. Zero is therefore "no wrapper found",
+    ///      not proof that none exists. An on-chain integrator under a tight gas stipend should use
+    ///      `wrapperKey`, which reverts instead.
     /// @param ca The collateral asset.
     /// @param ref The reference asset.
     /// @param mode The oracle mode the wrapper was built for.
@@ -531,15 +563,15 @@ interface IMarketRegistry {
         view
         returns (ConversionFeed[] memory page, uint256 total);
 
-    /// @notice Page through the registered denominations.
+    /// @notice Page through the registered denomination units, in registration order.
     /// @param offset Index of the first entry to return.
     /// @param limit Maximum number of entries to return.
-    /// @return page The requested slice of denominations (empty when offset is past the end).
+    /// @return page The requested slice of unit addresses (empty when offset is past the end).
     /// @return total The total number of registered denominations.
     function getDenominations(uint256 offset, uint256 limit)
         external
         view
-        returns (Denomination[] memory page, uint256 total);
+        returns (address[] memory page, uint256 total);
 
     /// @notice Page through the approved recipe contracts.
     /// @param offset Index of the first entry to return.

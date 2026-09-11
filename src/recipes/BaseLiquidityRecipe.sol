@@ -28,21 +28,23 @@ import {MarketRegistryLib} from "../MarketRegistryLib.sol";
 ///      entrypoints get that number from different places, and the asymmetry is the whole design:
 ///
 ///      - `resolve` runs OFF-CHAIN at signing time, when the pair's oracle may not exist yet. It
-///        prefers the live oracle and falls back to the anchor carried in `additionalData` when no
+///        prefers the live oracle and falls back to the anchor carried in `extraData` when no
 ///        oracle address is supplied.
 ///      - `verify` runs ON-CHAIN at fill time, after the adapter's step 3 has produced the oracle.
-///        It reads ONLY the oracle and ignores `additionalData` entirely — at that point a live rate
+///        It reads ONLY the oracle and ignores `extraData` entirely — at that point a live rate
 ///        is guaranteed, so the order's own account of the rate is not worth trusting.
+///
+///      `extraData` is produced by {encodeExtraData} and read back by {decodeExtraData}.
 abstract contract BaseLiquidityRecipe is IMarketRecipe, Initializable {
     // ─────────────────────────────── Errors ────────────────────────────────
 
     /// @notice Thrown at initialization when the registry address is zero.
     error ZeroRegistry();
 
-    /// @notice Thrown by `resolve` when no oracle was supplied and `additionalData` is not exactly one
-    ///         ABI word.
-    /// @param length The `additionalData` length that was supplied.
-    error MalformedAdditionalData(uint256 length);
+    /// @notice Thrown by {decodeExtraData}, and by `resolve` on its fallback path, when
+    ///         `extraData` is not exactly one ABI word.
+    /// @param length The `extraData` length that was supplied.
+    error MalformedExtraData(uint256 length);
 
     /// @notice Thrown by `resolve` when the anchor rate it settled on is zero.
     error ZeroAnchorRate();
@@ -132,14 +134,15 @@ abstract contract BaseLiquidityRecipe is IMarketRecipe, Initializable {
             "always, rateMax is twice the anchor rate, rateChangePerDayMax is the whole anchor rate "
             "and rateChangeCapacityMax is three times it. Nothing is configurable - all four limits "
             "are compile-time constants. resolve takes the anchor from the rate oracle when one is "
-            "supplied, and otherwise from additionalData = abi.encode(uint256 anchorRate). verify "
-            "ignores additionalData and requires an oracle: it checks that all four limits are "
+            "supplied, and otherwise from extraData, whose layout is defined by this contract's "
+            "encodeExtraData and decodeExtraData helpers. verify "
+            "ignores extraData and requires an oracle: it checks that all four limits are "
             "consistent with a single anchor and that the LIVE oracle rate sits strictly inside "
             "[rateMin, rateMax], so a window that no longer contains reality stops filling.";
     }
 
     /// @inheritdoc IMarketRecipe
-    /// @dev The live oracle is the preferred anchor, and `additionalData` is the fallback for the one
+    /// @dev The live oracle is the preferred anchor, and `extraData` is the fallback for the one
     ///      case the oracle cannot cover: the FIRST order ever written against a pair, signed before
     ///      the adapter's step 3 has deployed the oracle. `IMarketRecipe.resolve` warns that
     ///      `rateOracle` may well be `address(0)` at signing time for an oracle-backed recipe, so
@@ -147,7 +150,7 @@ abstract contract BaseLiquidityRecipe is IMarketRecipe, Initializable {
     ///      market.
     ///
     ///      A zero `rateOracle` is therefore the only thing that selects the fallback. Once an address
-    ///      is supplied it is authoritative and `additionalData` is not read at all — an agent that
+    ///      is supplied it is authoritative and `extraData` is not read at all — an agent that
     ///      passes both is telling us the oracle is live, and the oracle wins.
     ///
     ///      Reverts loudly on every bad input rather than returning a degenerate constraint, because
@@ -160,15 +163,14 @@ abstract contract BaseLiquidityRecipe is IMarketRecipe, Initializable {
         address, /* ca */
         address, /* ref */
         address rateOracle,
-        bytes calldata additionalData
+        bytes calldata extraData
     )
         external
         view
         override
         returns (IMarketRegistry.ResolvedConstraint memory constraint)
     {
-        uint256 anchorRate =
-            rateOracle == address(0) ? _decodeAnchorRate(additionalData) : IRateOracle(rateOracle).rate();
+        uint256 anchorRate = rateOracle == address(0) ? _decodeExtraData(extraData) : IRateOracle(rateOracle).rate();
         if (anchorRate == 0) revert ZeroAnchorRate();
 
         constraint = _constraintFor(anchorRate);
@@ -186,7 +188,7 @@ abstract contract BaseLiquidityRecipe is IMarketRecipe, Initializable {
     ///      adapter owns the revert and its selector. The one exception is a missing oracle, which is
     ///      "cannot answer" rather than "no" — see {RateOracleNotDeployed}.
     ///
-    ///      THE ORACLE IS THE ONLY RATE THIS FUNCTION TRUSTS. `additionalData` is ignored outright,
+    ///      THE ORACLE IS THE ONLY RATE THIS FUNCTION TRUSTS. `extraData` is ignored outright,
     ///      whatever it contains, because by the time this runs the adapter's step 3 has produced a
     ///      live oracle and the order's own account of the rate adds nothing but a way to lie.
     ///
@@ -232,8 +234,10 @@ abstract contract BaseLiquidityRecipe is IMarketRecipe, Initializable {
         address ca,
         address ref,
         address rateOracle,
+        uint256, /* expiryTimestamp: the liquidity bands are flat and do not depend on the market's life */
+        bool, /* creating */
         IMarketRegistry.ResolvedConstraint calldata constraint,
-        bytes calldata /* additionalData */
+        bytes calldata /* extraData */
     ) external view override returns (bool) {
         if (rateOracle == address(0)) revert RateOracleNotDeployed(ca, ref);
 
@@ -257,6 +261,24 @@ abstract contract BaseLiquidityRecipe is IMarketRecipe, Initializable {
         // Reality. Left last because it is the only check that costs an external call.
         uint256 rate = IRateOracle(rateOracle).rate();
         return rate > constraint.rateMin && rate < constraint.rateMax;
+    }
+
+    // ─────────────────────────────── Extra data helpers ─────────────────────
+
+    /// @notice Build the `extraData` this recipe reads on `resolve`'s fallback path.
+    /// @param anchorRate The anchor rate, 18-decimal fixed point (`1e18` = 1.0).
+    /// @return The bytes to pass as `extraData`.
+    function encodeExtraData(uint256 anchorRate) external pure returns (bytes memory) {
+        return abi.encode(anchorRate);
+    }
+
+    /// @notice Read the anchor rate back out of `extraData` exactly as `resolve` would.
+    /// @dev The deployed recipe is the layout oracle: off-chain callers compare
+    ///      `decodeExtraData(encoded)` with the anchor they encoded before signing.
+    /// @param extraData The order-carried bytes.
+    /// @return anchorRate The decoded anchor rate.
+    function decodeExtraData(bytes calldata extraData) external pure returns (uint256 anchorRate) {
+        return _decodeExtraData(extraData);
     }
 
     // ─────────────────────────────── Internal ───────────────────────────────
@@ -291,12 +313,13 @@ abstract contract BaseLiquidityRecipe is IMarketRecipe, Initializable {
         r.rateMin = RATE_MIN;
     }
 
-    /// @dev Decode `additionalData` as `abi.encode(uint256 anchorRate)`, rejecting anything that is
-    ///      not exactly one word with a named error. Reached only on `resolve`'s fallback path, when no
-    ///      oracle was supplied; `verify` never reads these bytes at all.
-    /// @param additionalData The order-carried bytes.
-    function _decodeAnchorRate(bytes calldata additionalData) private pure returns (uint256) {
-        if (additionalData.length != 32) revert MalformedAdditionalData(additionalData.length);
-        return abi.decode(additionalData, (uint256));
+    /// @dev The one decoder for `extraData`. {decodeExtraData} and `resolve`'s fallback path both
+    ///      come through here, so the helper and the hook cannot drift apart. `verify` never reads
+    ///      these bytes at all.
+    /// @param extraData The order-carried bytes.
+    /// @return The anchor rate the bytes carry.
+    function _decodeExtraData(bytes calldata extraData) internal pure returns (uint256) {
+        if (extraData.length != 32) revert MalformedExtraData(extraData.length);
+        return abi.decode(extraData, (uint256));
     }
 }

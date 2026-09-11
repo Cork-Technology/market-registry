@@ -18,9 +18,9 @@ import {IWrapper} from "./interfaces/IWrapper.sol";
 ///      `applyBands` alone. Being all-`internal` is what makes that free for a recipe: no library
 ///      deployment to link against, just inlined arithmetic.
 library MarketRegistryLib {
-    // ── compile-time constants (§17 — single source of truth) ──────────────────
+    // ── compile-time constants (single source of truth) ────────────────────────
 
-    /// @dev Walk hop cap for the underlying-asset walk in `deriveDenomination`. [RFC §10.2]
+    /// @dev Walk hop cap for the underlying-asset walk in `deriveDenomination`.
     ///      Unrelated to the conversion-feed hop budget in `resolvePath`, which is 1 or 2 and is set
     ///      by how many Morpho oracle feed slots the asset's source left free.
     uint256 internal constant MAX_DEPTH = 10;
@@ -45,17 +45,16 @@ library MarketRegistryLib {
     ///
     ///      Two jobs. (1) It is the TERMINUS of `resolvePath`: the Morpho oracle always works in US
     ///      Dollars, so every bridge walk ends here, and a unit that already IS this sentinel needs no
-    ///      bridge at all (the oracle reads a zero feed as the price 1). (2) It is the SEED VALUE the
-    ///      `"USD"` label is registered against — nothing in this library maps a string to it; the
-    ///      owner registers `"USD" → USD_DENOMINATION` once and the registry reads that mapping.
+    ///      bridge at all (the oracle reads a zero feed as the price 1). (2) `initialize` seeds it into
+    ///      the denomination set, so a US-Dollar-quoted source is writable on a fresh registry.
     address internal constant USD_DENOMINATION = 0x0000000000000000000000000000000000000348;
 
-    /// @dev Chainlink `Denominations` pseudo-address for Ether. ONE job: it is the seed value the
-    ///      `"ETH"` label is registered against in the denomination registry. Never called.
+    /// @dev Chainlink `Denominations` pseudo-address for Ether. ONE job: `initialize` seeds it into the
+    ///      denomination set. Never called.
     ///
     ///      `resolvePath` does NOT name it as an intermediate — it iterates the registered
     ///      denominations, and Ether is simply one of them. It happens to be the first candidate tried
-    ///      in practice, only because the constructor seeds `"USD"` and `"ETH"` before the owner
+    ///      in practice, only because `initialize` seeds US Dollars and Ether before the owner
     ///      registers anything else and candidates are walked in registration order. That is a gas
     ///      ordering, not a rule.
     address internal constant ETH_DENOMINATION = 0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE;
@@ -77,7 +76,7 @@ library MarketRegistryLib {
 
     // ── natural-key hashing ─────────────────────────────────────────────────────
 
-    /// @dev Natural-key hash for the asset store (BS-ST-03, §8/§17 normative):
+    /// @dev Natural-key hash for the asset store:
     ///      keccak256(abi.encode(addr)). No `chainId` — a registry instance holds only its own chain's
     ///      assets, so the chain is not a discriminator here, it is a field that could disagree with
     ///      reality.
@@ -85,7 +84,7 @@ library MarketRegistryLib {
         return keccak256(abi.encode(addr));
     }
 
-    /// @dev Secondary-index key for the asset name (BS-ST-06, §17 normative):
+    /// @dev Secondary-index key for the asset name:
     ///      keccak256(abi.encode(lowercasedName)). Fold covers ONLY bytes 0x41..0x5A
     ///      (ASCII A–Z), each += 0x20; every other byte is left untouched. Operates on a memory copy
     ///      so the caller's name is never mutated. No `chainId`, for the same reason as `assetKey`.
@@ -100,7 +99,7 @@ library MarketRegistryLib {
         return keccak256(abi.encode(string(folded)));
     }
 
-    /// @dev Natural-key hash for the conversion-feed store (BS-ST-07, §8/§17 normative):
+    /// @dev Natural-key hash for the conversion-feed store:
     ///      keccak256(abi.encode(base, quote)). No `chainId`.
     ///
     ///      Direction is part of the key and that is load-bearing: `feedKey(a, b)` and `feedKey(b, a)`
@@ -124,7 +123,7 @@ library MarketRegistryLib {
     // Insert = push key + record index+1. Remove = swap-and-pop with the moved-entry index fix.
 
     /// @dev Append a bytes32 key and record its position as index + 1 (0 = absent). Used by the
-    ///      asset, conversion-feed and denomination stores.
+    ///      asset and conversion-feed stores.
     function insertBytes32(bytes32[] storage keys, mapping(bytes32 => uint256) storage index, bytes32 key) internal {
         keys.push(key);
         index[key] = keys.length; // index + 1
@@ -148,16 +147,16 @@ library MarketRegistryLib {
         index[key] = 0; // clear removed key LAST
     }
 
-    /// @dev Append a recipe address and record its position as index + 1 (0 = absent). Address twin
-    ///      of `insertBytes32`, for the recipe store, whose keys are contract addresses rather than
-    ///      hashes.
+    /// @dev Append an address and record its position as index + 1 (0 = absent). Address twin of
+    ///      `insertBytes32`, for the recipe and denomination stores, whose keys are addresses rather
+    ///      than hashes.
     function insertAddress(address[] storage keys, mapping(address => uint256) storage index, address key) internal {
         keys.push(key);
         index[key] = keys.length; // index + 1
     }
 
-    /// @dev Swap-and-pop removal for the address-keyed recipe store. Caller MUST have checked
-    ///      existence. Same load-bearing ordering as `removeBytes32`, for the same reasons.
+    /// @dev Swap-and-pop removal for the address-keyed recipe and denomination stores. Caller MUST
+    ///      have checked existence. Same load-bearing ordering as `removeBytes32`, for the same reasons.
     function removeAddress(address[] storage keys, mapping(address => uint256) storage index, address key) internal {
         uint256 idx = index[key] - 1; // index + 1 → position
         uint256 last = keys.length - 1;
@@ -172,7 +171,7 @@ library MarketRegistryLib {
 
     // ── pagination ──────────────────────────────────────────────────────────────
 
-    /// @dev Pagination clamp shared by all the `get*` views (BS-VW-06..09). Returns the slice
+    /// @dev Pagination clamp shared by all the `get*` views. Returns the slice
     ///      `[offset, offset+limit)` clamped to `total`; an offset at or past the end yields an empty
     ///      page; never reverts. Overflow-safe: `count` is derived from `total - offset`, never
     ///      `offset + limit`.
@@ -264,18 +263,19 @@ library MarketRegistryLib {
     ///      PASSES the range check instead of reverting. Two field changes have already shifted these
     ///      offsets by one word each, and neither left any other trace.
     ///
-    ///      `e` is the calldata offset of the `Asset` head. Its ABI head is FIVE words, because `name`
-    ///      and BOTH `AssetSource` members are dynamic types (each `AssetSource` contains a `string`),
-    ///      so each of those contributes an OFFSET word rather than its data:
+    ///      `e` is the calldata offset of the `Asset` head. `AssetSource` is now a fully STATIC tuple
+    ///      (four value-typed fields, no string), so each source is laid out INLINE in the `Asset` head
+    ///      rather than behind an offset word. Only `name` is dynamic. The head is therefore eleven
+    ///      words:
     ///
-    ///          addr:0  ·  name-offset:32  ·  kind:64  ·  priceSource-offset:96
-    ///          navSource-offset:128
+    ///          addr:0  ·  name-offset:32  ·  kind:64
+    ///          priceSource: addr:96  ·  sourceType:128  ·  sourceInterface:160  ·  denomination:192
+    ///          navSource:   addr:224 ·  sourceType:256  ·  sourceInterface:288  ·  denomination:320
     ///
-    ///      Per the ABI, an offset inside a tuple is relative to the start of that tuple's encoding,
-    ///      so an `AssetSource` head sits at `e + calldataload(e + <offsetWord>)`. Each `AssetSource`
-    ///      head is four words, only the last of which is dynamic:
+    ///      So a source head sits at a FIXED offset from `e` — `e + 96` and `e + 224` — with no
+    ///      indirection through an offset word. Each source head is four words:
     ///
-    ///          addr:0  ·  sourceType:32  ·  sourceInterface:64  ·  denomination-offset:96
+    ///          addr:0  ·  sourceType:32  ·  sourceInterface:64  ·  denomination:96
     ///
     ///      ## Why both sources are checked, including absent ones
     ///
@@ -289,9 +289,9 @@ library MarketRegistryLib {
         uint256 priceHead;
         uint256 navHead;
         assembly {
-            rawKind := calldataload(add(e, 64)) // kind: 3rd static head word
-            priceHead := add(e, calldataload(add(e, 96))) // priceSource: 4th head word is its offset
-            navHead := add(e, calldataload(add(e, 128))) // navSource: 5th head word is its offset
+            rawKind := calldataload(add(e, 64)) // kind: 3rd head word
+            priceHead := add(e, 96) // priceSource: inline, words 4..7 of the head
+            navHead := add(e, 224) // navSource: inline, words 8..11 of the head
         }
         acc = uint256(IMarketRegistry.AssetKind(rawKind)); // Panic(0x21) if > last member
 
@@ -313,52 +313,42 @@ library MarketRegistryLib {
         acc += uint256(IMarketRegistry.SourceInterface(rawInterface)); // Panic(0x21) if > last member
     }
 
-    /// @dev BS-WLK-06 leaf source-quote rule, over the two NAMED source fields. Resolves iff every
-    ///      PRESENT source carries the SAME non-empty `denomination` (exact bytes, case-sensitive); any
-    ///      empty or disagreeing label → UNRESOLVED (empty string). No source contract is ever called —
-    ///      the label is read straight off the struct it is handed (INV-X-05).
+    /// @dev Leaf source-quote rule, over the two NAMED source fields. Resolves iff every
+    ///      PRESENT source carries the SAME non-zero `denomination` unit; a zero or disagreeing unit →
+    ///      UNRESOLVED (the zero address). No source contract is ever called — the unit is read
+    ///      straight off the struct it is handed.
     ///
     ///      ## This is an AGREEMENT test, not the denomination itself
     ///
-    ///      An asset's two sources may legitimately name DIFFERENT labels — `addAssets` validates each
-    ///      separately rather than requiring a match. So a `""` return does not mean "this asset has no
+    ///      An asset's two sources may legitimately quote DIFFERENT units — `addAssets` validates each
+    ///      separately rather than requiring a match. So a zero return does not mean "this asset has no
     ///      denomination"; it means "these two sources do not agree on one". Only the underlying-asset
-    ///      walk needs a single label, and only to decide a mid-chain terminal. `""` is not an error.
+    ///      walk needs a single unit, and only to decide a mid-chain terminal. Zero is not an error.
     ///
     ///      Parameters are `memory` rather than `calldata` so the same rule serves a caller holding a
     ///      caller-supplied entry and a caller reading a STORED one; both locations copy in implicitly.
     ///
     ///      Presence is `addr != 0`, matching every other reader. Three shapes: both present → they must
-    ///      agree, and the agreed label is returned; exactly one present → that one's label (if
-    ///      non-empty); neither present → UNRESOLVED, which is a real accepted registry state, since
+    ///      agree, and the agreed unit is returned; exactly one present → that one's unit (if
+    ///      non-zero); neither present → UNRESOLVED, which is a real accepted registry state, since
     ///      `addAssets` takes an asset with no source at all.
     function leafQuote(IMarketRegistry.AssetSource memory priceSource, IMarketRegistry.AssetSource memory navSource)
         internal
         pure
-        returns (string memory)
+        returns (address)
     {
         bool hasPrice = priceSource.addr != address(0);
         bool hasNav = navSource.addr != address(0);
 
         if (hasPrice && hasNav) {
-            bytes memory p = bytes(priceSource.denomination);
-            bytes memory n = bytes(navSource.denomination);
-            if (p.length == 0 || n.length == 0) return "";
-            if (keccak256(p) != keccak256(n)) return "";
+            if (priceSource.denomination != navSource.denomination) return address(0);
             return priceSource.denomination;
         }
 
-        if (hasPrice) {
-            if (bytes(priceSource.denomination).length == 0) return "";
-            return priceSource.denomination;
-        }
+        if (hasPrice) return priceSource.denomination;
+        if (hasNav) return navSource.denomination;
 
-        if (hasNav) {
-            if (bytes(navSource.denomination).length == 0) return "";
-            return navSource.denomination;
-        }
-
-        return ""; // neither source present → UNRESOLVED
+        return address(0); // neither source present → UNRESOLVED
     }
 
     // ── conversion-feed hop graph ─────────────────────────────────────────────────
@@ -389,7 +379,7 @@ library MarketRegistryLib {
     ///         secondAggregator]`, nearest-to-the-asset first, which is the order `feed1` then `feed2`
     ///         must be filled in. The FIRST complete pair wins, so registration order is the tie-break
     ///         when two intermediates would both work — a governance decision rather than an accident,
-    ///         and exactly what `docs/decisions/denomination-and-hop-graph.md` §(d) specifies.
+    ///         and exactly the tie-break the design specifies.
     ///
     ///      Two candidates are skipped inside the loop. `u == fromUnit`, because a unit cannot bridge
     ///      through itself — the guard an Ether-quoted source with no direct dollar edge lands on. And
@@ -403,8 +393,8 @@ library MarketRegistryLib {
     ///      fills an order against a newly-deployed oracle rather than by governance.
     ///
     ///      The bound is exactly **the number of registered denominations** — `_denominationKeys.length`
-    ///      — and the cost grows LINEARLY with it, at two to four `SLOAD`s per candidate. That is the
-    ///      whole reason the denomination set is OWNER-MANAGED: if anybody could register a label,
+    ///      — and the cost grows LINEARLY with it, at one to three `SLOAD`s per candidate. That is the
+    ///      whole reason the denomination set is OWNER-MANAGED: if anybody could register a unit,
     ///      anybody could lengthen this loop, so a permissionless registration path would be a
     ///      gas-griefing vector against every `deploy` on the chain. Owner-curated, it stays a list of
     ///      CURRENCIES — tens of entries, growing by governance transaction.
@@ -422,22 +412,20 @@ library MarketRegistryLib {
     ///      Reads the feed and denomination stores through the passed references and writes nothing.
     /// @param feedIndex The registry's `_feedIndex` — existence is `!= 0` (it stores `index + 1`).
     /// @param feeds The registry's `_feeds` — the records the aggregator addresses come from.
-    /// @param denominationKeys The registry's `_denominationKeys` — the label hashes to try as
-    ///        intermediates, in registration order. One entry per label and no duplicates; removing a
-    ///        label pops it from here, so the candidate list can SHRINK and a two-hop path that
-    ///        bridged through a removed label stops resolving from that call onward.
-    /// @param denominations The registry's `_denominations` — resolves each label hash to its unit.
+    /// @param denominationKeys The registry's `_denominationKeys` — the unit addresses to try as
+    ///        intermediates, in registration order. No duplicates; removing a unit pops it from here,
+    ///        so the candidate list can SHRINK and a two-hop path that bridged through a removed unit
+    ///        stops resolving from that call onward.
     /// @param fromUnit The unit address to bridge FROM: a token address, or a Chainlink
-    ///        `Denominations` pseudo-address. The caller has already resolved this from a registered
-    ///        denomination label, so an unregistered label reverted before reaching here.
+    ///        `Denominations` pseudo-address. The caller has already checked it is a registered
+    ///        denomination, so an unregistered unit reverted before reaching here.
     /// @param maxDepth The hop budget: 1 for an `AGGREGATOR_V3` source, 2 for an `ERC4626` source.
     /// @return feeds_ The aggregator addresses along the path, `feed1` first. Empty for the zero-hop
     ///         case.
     function resolvePath(
         mapping(bytes32 => uint256) storage feedIndex,
         mapping(bytes32 => IMarketRegistry.ConversionFeed) storage feeds,
-        bytes32[] storage denominationKeys,
-        mapping(bytes32 => address) storage denominations,
+        address[] storage denominationKeys,
         address fromUnit,
         uint256 maxDepth
     ) internal view returns (address[] memory feeds_) {
@@ -458,7 +446,7 @@ library MarketRegistryLib {
         // Level 2 — two edges through a registered intermediate. Bounded by the number of registered
         // denominations; see the bound note above before treating this loop as free.
         if (maxDepth >= 2) {
-            feeds_ = _twoHop(feedIndex, feeds, denominationKeys, denominations, fromUnit);
+            feeds_ = _twoHop(feedIndex, feeds, denominationKeys, fromUnit);
             if (feeds_.length != 0) return feeds_;
         }
 
@@ -471,24 +459,17 @@ library MarketRegistryLib {
     ///      because only it knows the budget the error must name.
     ///
     ///      Split out for the stack, not for reuse: the default Foundry profile has no `via_ir`, and
-    ///      four storage references plus the loop's locals on top of the caller's own is over the
+    ///      three storage references plus the loop's locals on top of the caller's own is close to the
     ///      legacy limit.
-    ///
-    ///      `denominations[k]` can never be zero for a `k` in `denominationKeys` — the add path rejects
-    ///      a zero unit, and the remove path clears the mapping entry and pops this array in the same
-    ///      call — so there is no zero-unit branch here. That pairing is load-bearing and must stay
-    ///      that way: a stale hash resolving to zero would merely probe `feedKey(fromUnit,
-    ///      address(0))`, find nothing, and continue, so the failure would be silent rather than loud.
     function _twoHop(
         mapping(bytes32 => uint256) storage feedIndex,
         mapping(bytes32 => IMarketRegistry.ConversionFeed) storage feeds,
-        bytes32[] storage denominationKeys,
-        mapping(bytes32 => address) storage denominations,
+        address[] storage denominationKeys,
         address fromUnit
     ) private view returns (address[] memory feeds_) {
         uint256 len = denominationKeys.length;
         for (uint256 i = 0; i < len; ++i) {
-            address u = denominations[denominationKeys[i]];
+            address u = denominationKeys[i];
 
             // A unit cannot bridge through itself, and the terminus is not an intermediate — see the
             // skip note on `resolvePath`.
@@ -536,8 +517,8 @@ library MarketRegistryLib {
         }
     }
 
-    /// @dev The denomination-derivation walk (§7.1 pseudocode, BS-WLK-01..09). Returns the derived
-    ///      denomination, or the empty string for UNRESOLVED — most failure terminals (depth,
+    /// @dev The denomination-derivation walk. Returns the derived
+    ///      denomination unit, or the zero address for UNRESOLVED — most failure terminals (depth,
     ///      cycle/self-loop, unregistered mid-chain leaf, disagreeing/empty/absent leaf sources, and
     ///      a probe target that reverts or lacks `asset()`) fall to UNRESOLVED. The exception: a probe
     ///      target that returns MALFORMED data — or that has NO CODE, which is the same event — reverts
@@ -556,48 +537,48 @@ library MarketRegistryLib {
         mapping(bytes32 => uint256) storage assetIndex,
         mapping(bytes32 => IMarketRegistry.Asset) storage assets,
         IMarketRegistry.Asset calldata e
-    ) internal view returns (string memory) {
+    ) internal view returns (address) {
         address cur = e.addr;
         address[] memory seen = new address[](MAX_DEPTH + 1); // in-memory cycle log; no storage
         uint256 depth = 0;
 
         while (true) {
-            if (depth > MAX_DEPTH) return ""; // BS-WLK-02 depth limit → UNRESOLVED
+            if (depth > MAX_DEPTH) return address(0); // depth limit → UNRESOLVED
 
-            // BS-WLK-03 cycle / self-loop: linear scan of the prior nodes.
+            // Cycle / self-loop: linear scan of the prior nodes.
             for (uint256 i = 0; i < depth; ++i) {
-                if (seen[i] == cur) return "";
+                if (seen[i] == cur) return address(0);
             }
 
             seen[depth] = cur;
 
-            // BS-WLK-04 registered-denominated terminal: only for a node past the head. There is no
+            // Registered-denominated terminal: only for a node past the head. There is no
             // pinned asset-level `denomination` to read, so the stored entry is asked the same question
             // its sources answer — apply the leaf rule to the two sources the registry holds for it. An
-            // entry whose sources disagree, or whose only source is absent, yields `""` and the walk
+            // entry whose sources disagree, or whose only source is absent, yields zero and the walk
             // carries on.
             if (cur != e.addr) {
                 bytes32 curKey = assetKey(cur);
                 if (assetIndex[curKey] != 0) {
                     IMarketRegistry.Asset storage stored = assets[curKey];
-                    string memory denom = leafQuote(stored.priceSource, stored.navSource);
-                    if (bytes(denom).length != 0) return denom;
+                    address denom = leafQuote(stored.priceSource, stored.navSource);
+                    if (denom != address(0)) return denom;
                 }
             }
 
-            // BS-WLK-09 bounded probe.
+            // Bounded probe.
             (bool hops, address underlying) = probeAsset(cur);
             if (hops) {
-                cur = underlying; // BS-WLK-05 hop
+                cur = underlying; // hop
                 unchecked {
                     ++depth;
                 }
                 continue;
             }
 
-            // BS-WLK-06 leaf source-quote terminal — now over the two named source fields.
+            // Leaf source-quote terminal — now over the two named source fields.
             if (cur == e.addr) return leafQuote(e.priceSource, e.navSource);
-            return ""; // BS-WLK-07 unregistered mid-chain leaf → UNRESOLVED
+            return address(0); // unregistered mid-chain leaf → UNRESOLVED
         }
         // Unreachable: the loop only exits via `return`.
         revert();

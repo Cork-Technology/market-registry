@@ -6,9 +6,11 @@ import {IDefaultCorkController} from "contracts/interfaces/IDefaultCorkControlle
 import {IPoolManager} from "contracts/interfaces/IPoolManager.sol";
 
 import {CorkLimitOrderAdapter} from "../src/CorkLimitOrderAdapter.sol";
+import {CorkMarketCreator} from "../src/CorkMarketCreator.sol";
 import {FixedRateOracleFactory} from "../src/FixedRateOracleFactory.sol";
 import {MarketRegistry} from "../src/MarketRegistry.sol";
 import {WrapperRateConsumerFactory} from "../src/WrapperRateConsumerFactory.sol";
+import {ICorkMarketCreator} from "../src/interfaces/ICorkMarketCreator.sol";
 import {IMarketRegistry} from "../src/interfaces/IMarketRegistry.sol";
 import {FixedRateRecipe} from "../src/recipes/FixedRateRecipe.sol";
 import {LiquidityNavRecipe} from "../src/recipes/LiquidityNavRecipe.sol";
@@ -88,19 +90,19 @@ contract InitializationTest is Test {
         MockJITPoolManager poolManager = new MockJITPoolManager();
         MockJITController controller = new MockJITController(poolManager);
         MockLimitOrderProtocol lop = new MockLimitOrderProtocol();
-
-        CorkLimitOrderAdapter hook = new CorkLimitOrderAdapter();
-        hook.initialize(
-            address(lop),
+        CorkMarketCreator creator = new CorkMarketCreator();
+        creator.initialize(
             IPoolManager(address(poolManager)),
             IDefaultCorkController(address(controller)),
             IMarketRegistry(address(reg))
         );
 
+        CorkLimitOrderAdapter hook = new CorkLimitOrderAdapter();
+        hook.initialize(address(lop), IPoolManager(address(poolManager)), ICorkMarketCreator(address(creator)));
+
         assertEq(hook.LIMIT_ORDER_PROTOCOL(), address(lop), "limit order protocol not pinned");
         assertEq(address(hook.POOL_MANAGER()), address(poolManager), "pool manager not pinned");
-        assertEq(address(hook.CONTROLLER()), address(controller), "controller not pinned");
-        assertEq(address(hook.MARKET_REGISTRY()), address(reg), "market registry not pinned");
+        assertEq(address(hook.MARKET_CREATOR()), address(creator), "market creator not pinned");
     }
 
     function test_corkLimitOrderAdapter_secondInitialize_reverts() public {
@@ -108,22 +110,18 @@ contract InitializationTest is Test {
         MockJITPoolManager poolManager = new MockJITPoolManager();
         MockJITController controller = new MockJITController(poolManager);
         MockLimitOrderProtocol lop = new MockLimitOrderProtocol();
+        CorkMarketCreator creator = new CorkMarketCreator();
+        creator.initialize(
+            IPoolManager(address(poolManager)),
+            IDefaultCorkController(address(controller)),
+            IMarketRegistry(address(reg))
+        );
 
         CorkLimitOrderAdapter hook = new CorkLimitOrderAdapter();
-        hook.initialize(
-            address(lop),
-            IPoolManager(address(poolManager)),
-            IDefaultCorkController(address(controller)),
-            IMarketRegistry(address(reg))
-        );
+        hook.initialize(address(lop), IPoolManager(address(poolManager)), ICorkMarketCreator(address(creator)));
 
         vm.expectRevert(ALREADY_INITIALIZED);
-        hook.initialize(
-            address(lop),
-            IPoolManager(address(poolManager)),
-            IDefaultCorkController(address(controller)),
-            IMarketRegistry(address(reg))
-        );
+        hook.initialize(address(lop), IPoolManager(address(poolManager)), ICorkMarketCreator(address(creator)));
     }
 
     // ── LiquidityPriceRecipe ────────────────────────────────────────────────────

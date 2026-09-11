@@ -44,7 +44,6 @@ contract GovernanceTest is Test {
     bytes4 internal INVALID_OWNER = Ownable.OwnableInvalidOwner.selector;
     bytes4 internal RENOUNCE_DISABLED = IMarketRegistry.RenounceDisabled.selector;
     bytes4 internal ZERO_ADDRESS = IMarketRegistry.ZeroAddress.selector;
-    bytes4 internal EMPTY_NAME = IMarketRegistry.EmptyName.selector;
     bytes4 internal ZERO_BOUND = IMarketRegistry.ZeroBound.selector;
 
     MockWrapperFactory internal wrapperFactory;
@@ -77,14 +76,14 @@ contract GovernanceTest is Test {
             makeAddr("asset"),
             "TEST",
             IMarketRegistry.AssetKind.ERC20,
-            mkPriceSource(makeAddr("source"), "USD"),
+            mkPriceSource(makeAddr("source"), MarketRegistryLib.USD_DENOMINATION),
             noSource()
         );
     }
 
     function _minimalFeed() internal returns (IMarketRegistry.ConversionFeed memory f) {
         f = IMarketRegistry.ConversionFeed({
-            base: makeAddr("base"), quote: makeAddr("quote"), aggregatorAddress: makeAddr("aggregator"), feedDecimals: 8
+            base: makeAddr("base"), quote: makeAddr("quote"), aggregatorAddress: makeAddr("aggregator")
         });
     }
 
@@ -131,33 +130,32 @@ contract GovernanceTest is Test {
         );
     }
 
-    /// @notice The constructor SEEDS `"USD"` and `"ETH"` into the denomination registry, so a fresh
-    ///         deployment is never in the state where nothing resolves.
+    /// @notice `initialize` SEEDS the US Dollar and Ether pseudo-units into the denomination set, so a
+    ///         fresh deployment is never in the state where nothing resolves.
     /// @dev Without the seed the owner's first action would be forced boilerplate, and forgetting it
     ///      would look like a broken registry rather than an unconfigured one: every `addAssets` would
     ///      revert `UnregisteredDenomination`. Asserted through BEHAVIOUR rather than through
-    ///      `lookupDenomination`: that a "USD"-quoted source is writable on a brand-new registry is the
+    ///      `isDenomination`: that a US-Dollar-quoted source is writable on a brand-new registry is the
     ///      claim that actually matters, and the getter agreeing would not prove it.
     function test_constructor_seedsUsdAndEthDenominations() public {
-        // "ETH" needs its dollar bridge before an ETH-quoted source is writable; "USD" needs nothing.
+        // Ether needs its dollar bridge before an Ether-quoted source is writable; US Dollars needs nothing.
         vm.prank(owner);
         iReg.addConversionFeeds(
             one(
                 IMarketRegistry.ConversionFeed({
                     base: MarketRegistryLib.ETH_DENOMINATION,
                     quote: MarketRegistryLib.USD_DENOMINATION,
-                    aggregatorAddress: makeAddr("ethUsd"),
-                    feedDecimals: 8
+                    aggregatorAddress: makeAddr("ethUsd")
                 })
             )
         );
 
         vm.prank(owner);
-        iReg.addDenominations(one("SEEDPROBE"), one(makeAddr("probeUnit"))); // proves the owner path works too
+        iReg.addDenominations(one(makeAddr("probeUnit"))); // proves the owner path works too
 
-        assertTrue(_quoteUnitAccepted("USD"), "\"USD\" must be seeded at construction");
-        assertTrue(_quoteUnitAccepted("ETH"), "\"ETH\" must be seeded at construction");
-        assertFalse(_quoteUnitAccepted("usd"), "registration is case-sensitive: \"usd\" is not \"USD\"");
+        assertTrue(_quoteUnitAccepted(MarketRegistryLib.USD_DENOMINATION), "US Dollars must be seeded at initialize");
+        assertTrue(_quoteUnitAccepted(MarketRegistryLib.ETH_DENOMINATION), "Ether must be seeded at initialize");
+        assertFalse(_quoteUnitAccepted(makeAddr("neverRegistered")), "an unregistered unit must not be accepted");
     }
 
     // ── owner-gating sweep across every mutating function ───────────────────────
@@ -197,11 +195,11 @@ contract GovernanceTest is Test {
 
         // 5/8 addDenominations
         _expectUnauthorized(stranger);
-        iReg.addDenominations(one("USDC"), one(makeAddr("usdc")));
+        iReg.addDenominations(one(makeAddr("usdc")));
 
         // 6/8 removeDenominations
         _expectUnauthorized(stranger);
-        iReg.removeDenominations(one("USD"));
+        iReg.removeDenominations(one(MarketRegistryLib.USD_DENOMINATION));
 
         // 7/8 addRecipes
         _expectUnauthorized(stranger);
@@ -219,7 +217,7 @@ contract GovernanceTest is Test {
     function test_deploy_isPermissionless() public {
         vm.prank(stranger);
         vm.expectRevert(IMarketRegistry.EntryNotFound.selector);
-        iReg.deploy(makeAddr("ca"), makeAddr("ref"), IMarketRegistry.OracleMode.PRICE);
+        iReg.deploy(makeAddr("ca"), makeAddr("ref"), IMarketRegistry.OracleMode.PRICE, bytes32(0));
     }
 
     // ── the fixed-rate oracle entrypoint (permissionless, stateless, idempotent) ──
@@ -436,126 +434,103 @@ contract GovernanceTest is Test {
         assertEq(reg.maxExpiryDuration(), expiry, "a no-op set must leave the expiry bound where it was");
     }
 
-    // ── registerDenomination structural checks ──────────────────────────────────
+    // ── addDenominations structural checks ──────────────────────────────────────
 
-    /// @notice An empty label is refused, and so is a zero unit — the two structural checks on the one
-    ///         write path the constructor's seed also uses.
-    function test_addDenominations_structuralChecks() public {
-        vm.prank(owner);
-        vm.expectRevert(EMPTY_NAME);
-        iReg.addDenominations(one(""), one(makeAddr("unit")));
-
+    /// @notice A zero unit is refused — the one structural check on the write path `initialize`'s
+    ///         seed also uses.
+    function test_addDenominations_zeroUnit_reverts() public {
         vm.prank(owner);
         vm.expectRevert(ZERO_ADDRESS);
-        iReg.addDenominations(one("USDC"), one(address(0)));
+        iReg.addDenominations(one(address(0)));
     }
 
-    /// @notice Re-registering an EXISTING label is REFUSED. Registration is add-only; correcting a
-    ///         label's unit is a removal followed by an add.
-    /// @dev This is the behaviour that flipped when the API converged. The old path was
-    ///      create-or-overwrite, which was defensible only while there was no removal path to pair a
-    ///      duplicate-rejection with. There is one now, so an overwrite would be a second, silent way
-    ///      to change a label — and silent is the problem: a re-point that leaves no removal in the log
-    ///      is indistinguishable from a first registration to anyone reading events.
-    function test_addDenominations_existingLabel_reverts() public {
+    /// @notice Registering a unit that is already in the set is REFUSED. Registration is add-only.
+    /// @dev A silent no-op would be a second way to "add" a unit that leaves nothing in the log, and
+    ///      the bridge search would then depend on nothing having doubled up the candidate list.
+    function test_addDenominations_existingUnit_reverts() public {
+        address unit = makeAddr("gbpxUnit");
         vm.prank(owner);
-        iReg.addDenominations(one("GBPX"), one(makeAddr("gbpxUnit")));
+        iReg.addDenominations(one(unit));
 
         vm.prank(owner);
         vm.expectRevert(IMarketRegistry.EntryAlreadyExists.selector);
-        iReg.addDenominations(one("GBPX"), one(makeAddr("gbpxOtherUnit")));
+        iReg.addDenominations(one(unit));
     }
 
-    /// @notice Re-pointing a label is remove-then-add, and it takes effect on the very next read.
-    /// @dev Observed two ways: through `lookupDenomination`, which is the direct answer, and through the
-    ///      GRAPH, which is the one that matters — the label starts out pointing at a unit WITH a dollar
-    ///      edge (so a source quoting it is writable) and ends up pointing at one WITHOUT (so the same
-    ///      source stops being writable). Re-pointing does NOT retroactively revalidate assets that
-    ///      already stored the label; they keep their stored string and start failing at `deploy`.
-    function test_denomination_rePointIsRemoveThenAdd() public {
+    /// @notice Swapping one unit for another is remove-then-add, and it takes effect on the very next
+    ///         write.
+    /// @dev Observed through the GRAPH, which is the check that matters — the first unit has a dollar
+    ///      edge (so a source quoting it is writable); the second has none (so a source quoting it is
+    ///      not). Both halves land in the log, keyed on the unit address itself.
+    function test_denomination_swapIsRemoveThenAdd() public {
         address unitWithPath = makeAddr("gbpxUnitWithPath");
         address unitWithoutPath = makeAddr("gbpxUnitWithoutPath");
 
         vm.prank(owner);
-        iReg.addDenominations(one("GBPX"), one(unitWithPath));
+        iReg.addDenominations(one(unitWithPath));
         vm.prank(owner);
-        iReg.addConversionFeeds(one(mkFeed(unitWithPath, MarketRegistryLib.USD_DENOMINATION, makeAddr("gbpxUsd"), 8)));
-        assertTrue(_quoteUnitAccepted("GBPX"), "setup: the first registration should be usable");
+        iReg.addConversionFeeds(one(mkFeed(unitWithPath, MarketRegistryLib.USD_DENOMINATION, makeAddr("gbpxUsd"))));
+        assertTrue(_quoteUnitAccepted(unitWithPath), "setup: the first registration should be usable");
 
-        // The re-point, as a curator Safe would bundle it. Both halves land in the log: the removal
-        // names the label it dropped, the add carries the label alongside the unit it now points at.
         vm.startPrank(owner);
         vm.expectEmit(true, true, false, true, address(reg));
         emit IMarketRegistry.EntryRemoved(
-            IMarketRegistry.Namespace.Denomination, keccak256(bytes("GBPX")), abi.encode(string("GBPX"))
+            IMarketRegistry.Namespace.Denomination, bytes32(uint256(uint160(unitWithPath))), abi.encode(unitWithPath)
         );
-        iReg.removeDenominations(one("GBPX"));
+        iReg.removeDenominations(one(unitWithPath));
 
         vm.expectEmit(true, true, false, true, address(reg));
         emit IMarketRegistry.EntryAdded(
             IMarketRegistry.Namespace.Denomination,
-            keccak256(bytes("GBPX")),
-            abi.encode(string("GBPX"), unitWithoutPath)
+            bytes32(uint256(uint160(unitWithoutPath))),
+            abi.encode(unitWithoutPath)
         );
-        iReg.addDenominations(one("GBPX"), one(unitWithoutPath));
+        iReg.addDenominations(one(unitWithoutPath));
         vm.stopPrank();
 
-        (bool found, address unit) = iReg.lookupDenomination("GBPX");
-        assertTrue(found, "the label must still be registered after the re-point");
-        assertEq(unit, unitWithoutPath, "lookup must report the NEW unit");
-
-        assertFalse(
-            _quoteUnitAccepted("GBPX"), "a re-pointed label must resolve through the NEW unit, which has no path"
-        );
+        assertFalse(iReg.isDenomination(unitWithPath), "the removed unit must be gone");
+        assertTrue(iReg.isDenomination(unitWithoutPath), "the added unit must be registered");
+        assertFalse(_quoteUnitAccepted(unitWithPath), "a source quoting the removed unit must stop being writable");
+        assertFalse(_quoteUnitAccepted(unitWithoutPath), "the new unit is registered but has no dollar path");
     }
 
-    /// @notice Removing a label makes it stop resolving, and a source quoting it stops being writable.
-    /// @dev The teeth. There is no cascade: an asset that already stored the label keeps its entry and
+    /// @notice Removing a unit makes `isDenomination` false, and a source quoting it stops being
+    ///         writable.
+    /// @dev The teeth. There is no cascade: an asset that already stored the unit keeps its entry and
     ///      starts failing, which is the same shape `removeConversionFeeds` has.
-    function test_removeDenominations_labelStopsResolving() public {
+    function test_removeDenominations_unitStopsResolving() public {
+        address unit = makeAddr("gbpyUnit");
         vm.prank(owner);
-        iReg.addDenominations(one("GBPY"), one(makeAddr("gbpyUnit")));
-        (bool foundBefore,) = iReg.lookupDenomination("GBPY");
-        assertTrue(foundBefore, "setup: the label should resolve after the add");
+        iReg.addDenominations(one(unit));
+        assertTrue(iReg.isDenomination(unit), "setup: the unit should be registered after the add");
 
         vm.prank(owner);
-        iReg.removeDenominations(one("GBPY"));
+        iReg.removeDenominations(one(unit));
 
-        (bool foundAfter, address unit) = iReg.lookupDenomination("GBPY");
-        assertFalse(foundAfter, "a removed label must stop resolving");
-        assertEq(unit, address(0), "a removed label must report the zero unit");
-        assertFalse(_quoteUnitAccepted("GBPY"), "a source quoting a removed label must stop being writable");
+        assertFalse(iReg.isDenomination(unit), "a removed unit must stop being registered");
+        assertFalse(_quoteUnitAccepted(unit), "a source quoting a removed unit must stop being writable");
     }
 
-    /// @notice Removing a label that was never registered reverts `EntryNotFound`.
+    /// @notice Removing a unit that was never registered reverts `EntryNotFound`.
     function test_removeDenominations_missing_reverts() public {
         vm.prank(owner);
         vm.expectRevert(IMarketRegistry.EntryNotFound.selector);
-        iReg.removeDenominations(one("NEVERREGISTERED"));
+        iReg.removeDenominations(one(makeAddr("neverRegistered")));
     }
 
-    /// @notice Even the constructor's seeds are removable — nothing is privileged.
-    /// @dev Removing `"USD"` is close to bricking the registry, since almost nothing resolves a path
-    ///      afterwards. It is still allowed: this is a governance decision, and the constructor does not
+    /// @notice Even `initialize`'s seeds are removable — nothing is privileged.
+    /// @dev Removing US Dollars is close to bricking the registry, since almost nothing resolves a path
+    ///      afterwards. It is still allowed: this is a governance decision, and `initialize` does not
     ///      get to veto it.
-    function test_removeDenominations_seededLabelIsRemovable() public {
+    function test_removeDenominations_seededUnitIsRemovable() public {
         vm.prank(owner);
-        iReg.removeDenominations(one("USD"));
+        iReg.removeDenominations(one(MarketRegistryLib.USD_DENOMINATION));
 
-        (bool found,) = iReg.lookupDenomination("USD");
-        assertFalse(found, "the seeded USD label must be removable like any other");
-        assertFalse(_quoteUnitAccepted("USD"), "nothing quoting USD should be writable once it is gone");
-    }
-
-    /// @notice `addDenominations` refuses mismatched array lengths rather than silently truncating.
-    function test_addDenominations_lengthMismatch_reverts() public {
-        string[] memory labels = new string[](2);
-        labels[0] = "AAA";
-        labels[1] = "BBB";
-
-        vm.prank(owner);
-        vm.expectRevert(IMarketRegistry.ArrayLengthMismatch.selector);
-        iReg.addDenominations(labels, one(makeAddr("onlyOneUnit")));
+        assertFalse(iReg.isDenomination(MarketRegistryLib.USD_DENOMINATION), "the seeded USD unit must be removable");
+        assertFalse(
+            _quoteUnitAccepted(MarketRegistryLib.USD_DENOMINATION),
+            "nothing quoting USD should be writable once it is gone"
+        );
     }
 
     // ── transferOwnership (two-step) ────────────────────────────────────────────
@@ -647,20 +622,20 @@ contract GovernanceTest is Test {
 
     // ── internal probes ─────────────────────────────────────────────────────────
 
-    /// @dev Is `label` a registered denomination with a dollar path? Probed by attempting an add whose
-    ///      only source quotes it. Deliberately NOT `lookupDenomination`, which answers only the first
-    ///      half of the question — behaviour is the honest oracle for both halves at once. Each probe uses a FRESH asset address and name so a success cannot
-    ///      collide with a previous one.
-    function _quoteUnitAccepted(string memory label) internal returns (bool) {
-        // A DEPLOYED token, not a label: the walk probes the asset address, and a call to a codeless
-        // address makes the probe's ABI decode revert uncatchably, which would make every probe
-        // answer "not accepted" for the wrong reason.
+    /// @dev Is `unit` a registered denomination with a dollar path? Probed by attempting an add whose
+    ///      only source quotes it. Deliberately NOT `isDenomination`, which answers only the first half
+    ///      of the question — behaviour is the honest oracle for both halves at once. Each probe uses a
+    ///      FRESH asset address and name so a success cannot collide with a previous one.
+    function _quoteUnitAccepted(address unit) internal returns (bool) {
+        // A DEPLOYED token, not a bare address: the walk probes the asset address, and a call to a
+        // codeless address makes the probe's ABI decode revert uncatchably, which would make every
+        // probe answer "not accepted" for the wrong reason.
         address token = address(new MockERC20("Probe", "PRB", 18));
         IMarketRegistry.Asset memory e = mkAsset(
             token,
-            string.concat("PROBE:", label),
+            string.concat("PROBE:", vm.toString(token)),
             IMarketRegistry.AssetKind.ERC20,
-            mkPriceSource(makeAddr("probeSource"), label),
+            mkPriceSource(makeAddr("probeSource"), unit),
             noSource()
         );
         vm.prank(owner);

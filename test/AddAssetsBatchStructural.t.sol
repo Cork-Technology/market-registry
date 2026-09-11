@@ -3,6 +3,7 @@ pragma solidity ^0.8.30;
 import {Test} from "forge-std/Test.sol";
 import {FixedRateOracleFactory} from "../src/FixedRateOracleFactory.sol";
 import {MarketRegistry} from "../src/MarketRegistry.sol";
+import {MarketRegistryLib} from "../src/MarketRegistryLib.sol";
 import {IMarketRegistry} from "../src/interfaces/IMarketRegistry.sol";
 import {mkAsset, mkPriceSource, noSource} from "./fixtures/TenAssetSet.sol";
 import {MockERC20} from "./mocks/HostileAssets.sol";
@@ -31,6 +32,7 @@ contract AddAssetsBatchStructuralTest is Test {
     address internal tokenC;
 
     address internal constant SRC = address(0x5A25);
+    address internal constant USD_UNIT = MarketRegistryLib.USD_DENOMINATION;
 
     MockWrapperFactory internal wrapperFactory;
 
@@ -50,8 +52,8 @@ contract AddAssetsBatchStructuralTest is Test {
     }
 
     /// @dev One price source stating `denomination_`, NAV slot absent. There is no asset-level
-    ///      denomination argument any more — the label belongs to the source.
-    function _asset(address addr_, string memory name_, string memory denomination_)
+    ///      denomination argument any more — the unit belongs to the source.
+    function _asset(address addr_, string memory name_, address denomination_)
         internal
         pure
         returns (IMarketRegistry.Asset memory)
@@ -65,9 +67,9 @@ contract AddAssetsBatchStructuralTest is Test {
     ///         0 and reverts the entire transaction.
     function test_addAssetsBatch_duplicateInBatch_reverts() public {
         IMarketRegistry.Asset[] memory batch = new IMarketRegistry.Asset[](3);
-        batch[0] = _asset(tokenA, "AAA", "USD");
-        batch[1] = _asset(tokenB, "BBB", "USD");
-        batch[2] = _asset(tokenA, "CCC", "USD"); // duplicate natural key of batch[0]
+        batch[0] = _asset(tokenA, "AAA", USD_UNIT);
+        batch[1] = _asset(tokenB, "BBB", USD_UNIT);
+        batch[2] = _asset(tokenA, "CCC", USD_UNIT); // duplicate natural key of batch[0]
 
         vm.prank(owner);
         vm.expectRevert(IMarketRegistry.EntryAlreadyExists.selector);
@@ -86,8 +88,8 @@ contract AddAssetsBatchStructuralTest is Test {
     ///         differ — the name index is checked per entry, on the state prior entries left behind.
     function test_addAssetsBatch_duplicateNameInBatch_reverts() public {
         IMarketRegistry.Asset[] memory batch = new IMarketRegistry.Asset[](2);
-        batch[0] = _asset(tokenA, "USDC", "USD");
-        batch[1] = _asset(tokenB, "usdc", "USD"); // same folded name, different address
+        batch[0] = _asset(tokenA, "USDC", USD_UNIT);
+        batch[1] = _asset(tokenB, "usdc", USD_UNIT); // same folded name, different address
 
         vm.prank(owner);
         vm.expectRevert(IMarketRegistry.EntryAlreadyExists.selector);
@@ -105,12 +107,13 @@ contract AddAssetsBatchStructuralTest is Test {
     ///      transaction rather than quietly landing eight of nine entries.
     function test_addAssetsBatch_unregisteredDenominationInBatch_revertsWholeBatch() public {
         IMarketRegistry.Asset[] memory batch = new IMarketRegistry.Asset[](3);
-        batch[0] = _asset(tokenA, "AAA", "USD");
-        batch[1] = _asset(tokenB, "BBB", "MADEUP"); // never registered
-        batch[2] = _asset(tokenC, "CCC", "USD");
+        batch[0] = _asset(tokenA, "AAA", USD_UNIT);
+        address madeUpUnit = makeAddr("madeUpUnit");
+        batch[1] = _asset(tokenB, "BBB", madeUpUnit); // never registered
+        batch[2] = _asset(tokenC, "CCC", USD_UNIT);
 
         vm.prank(owner);
-        vm.expectRevert(abi.encodeWithSelector(IMarketRegistry.UnregisteredDenomination.selector, "MADEUP"));
+        vm.expectRevert(abi.encodeWithSelector(IMarketRegistry.UnregisteredDenomination.selector, madeUpUnit));
         reg.addAssets(batch);
 
         (, uint256 total) = reg.getAssets(0, 10);
@@ -120,9 +123,9 @@ contract AddAssetsBatchStructuralTest is Test {
     /// @notice The happy path: three well-formed entries all land, and enumeration reports all three.
     function test_addAssetsBatch_batch_allPersisted() public {
         IMarketRegistry.Asset[] memory batch = new IMarketRegistry.Asset[](3);
-        batch[0] = _asset(tokenA, "AAA", "USD");
-        batch[1] = _asset(tokenB, "BBB", "USD");
-        batch[2] = _asset(tokenC, "CCC", "USD");
+        batch[0] = _asset(tokenA, "AAA", USD_UNIT);
+        batch[1] = _asset(tokenB, "BBB", USD_UNIT);
+        batch[2] = _asset(tokenC, "CCC", USD_UNIT);
 
         vm.prank(owner);
         reg.addAssets(batch);
@@ -132,11 +135,11 @@ contract AddAssetsBatchStructuralTest is Test {
         for (uint256 i = 0; i < batch.length; i++) {
             (bool found, IMarketRegistry.Asset memory got) = reg.lookupAssetByAddress(batch[i].addr);
             assertTrue(found, "seeded asset missing");
-            // The label lives on the SOURCE now, and `addAsset` stores it verbatim. The absent NAV slot
-            // reads back as the empty string, because an absent source is zeroed rather than copied.
-            assertEq(got.priceSource.denomination, "USD", "seeded price source denomination mismatch");
+            // The unit lives on the SOURCE now, and `addAsset` stores it verbatim. The absent NAV slot
+            // reads back as the zero address, because an absent source is zeroed rather than copied.
+            assertEq(got.priceSource.denomination, USD_UNIT, "seeded price source denomination mismatch");
             assertEq(got.navSource.addr, address(0), "absent NAV slot should be zeroed");
-            assertEq(got.navSource.denomination, "", "absent NAV slot should carry no denomination");
+            assertEq(got.navSource.denomination, address(0), "absent NAV slot should carry no denomination");
         }
     }
 }

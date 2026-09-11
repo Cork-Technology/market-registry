@@ -9,6 +9,7 @@ import {
     MessagingReceipt,
     Origin
 } from "@layerzerolabs/lz-evm-protocol-v2/contracts/interfaces/ILayerZeroEndpointV2.sol";
+import {SetConfigParam} from "@layerzerolabs/lz-evm-protocol-v2/contracts/interfaces/IMessageLibManager.sol";
 import {MockLayerZeroEndpoint} from "./mocks/CrosschainMocks.sol";
 
 /// @title RemoteNavFeedGas.t.sol — gas measurements for the refresh round trip
@@ -34,6 +35,8 @@ contract RemoteNavFeedGasTest is Test {
     function setUp() public {
         vm.warp(1_777_000_000);
         endpoint = new MockLayerZeroEndpoint();
+        SetConfigParam[] memory readConfig = new SetConfigParam[](1);
+        readConfig[0] = SetConfigParam({eid: READ_CHANNEL, configType: 1, config: hex"c0ffee"});
         feed = new RemoteNavFeed(
             ILayerZeroEndpointV2(address(endpoint)),
             TARGET_EID,
@@ -42,6 +45,8 @@ contract RemoteNavFeedGasTest is Test {
             CONFIRMATIONS,
             100_000,
             MAX_STALENESS,
+            makeAddr("read library"),
+            readConfig,
             "vault NAV (LayerZero Read)"
         );
     }
@@ -66,6 +71,15 @@ contract RemoteNavFeedGasTest is Test {
         MessagingReceipt memory receipt = feed.refresh();
         uint256 gasUsed = _deliverMeasured(receipt.nonce, 1.07e6, 500);
         emit log_named_uint("lzReceive: first delivery (seeds scale, advances pointer)", gasUsed);
+    }
+
+    /// @dev Worst case for the executor: nothing about the feed is warm when the
+    ///      response lands. This is the number MIN_GAS_ALLOWANCE's comment tracks.
+    function test_gas_lzReceive_firstDelivery_cold() public {
+        MessagingReceipt memory receipt = feed.refresh();
+        vm.cool(address(feed));
+        uint256 gasUsed = _deliverMeasured(receipt.nonce, 1.07e6, 500);
+        emit log_named_uint("lzReceive: first delivery, cold feed (worst case)", gasUsed);
     }
 
     function test_gas_lzReceive_steadyState() public {

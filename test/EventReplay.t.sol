@@ -38,9 +38,8 @@ contract RegistryMirror {
     bytes32[] internal _feedKeys;
     mapping(bytes32 key => uint256) internal _feedIndex;
 
-    mapping(bytes32 labelHash => address unit) internal _denominations;
-    bytes32[] internal _denominationKeys;
-    mapping(bytes32 labelHash => uint256) internal _denominationIndex;
+    address[] internal _denominationKeys;
+    mapping(address unit => uint256) internal _denominationIndex;
 
     address[] internal _recipeKeys;
     mapping(address recipe => uint256) internal _recipeIndex;
@@ -50,8 +49,8 @@ contract RegistryMirror {
     // ── the fold ──────────────────────────────────────────────────────────────
 
     /// @notice Apply one log record. Anything unrecognised is ignored, as an indexer would ignore it.
-    ///         The emitter rides along because the wrapper key includes the registry address — an
-    ///         indexer folding logs from two registries must not let their records collide.
+    ///         The emitter rides along because two registries sharing one factory each keep their own
+    ///         wrapper record — an indexer folding logs from both must not let them collide.
     function applyEvent(address emitter, bytes32[] memory topics, bytes memory data) external {
         if (topics.length == 0) return;
 
@@ -60,11 +59,12 @@ contract RegistryMirror {
         } else if (topics[0] == IMarketRegistry.EntryRemoved.selector) {
             _removed(IMarketRegistry.Namespace(uint8(uint256(topics[1]))), topics[2], abi.decode(data, (bytes)));
         } else if (topics[0] == IMarketRegistry.MarketOracleDeployed.selector) {
-            (, address caSource, address refSource,) = abi.decode(data, (uint8, address, address, address));
+            // The registry's own storage key folds in live wiring an indexer cannot see, so the mirror
+            // keys on what the log carries: the pair and the mode the wrapper answers for.
+            (uint8 mode,,,) = abi.decode(data, (uint8, address, address, address));
             address ca = address(uint160(uint256(topics[1])));
             address ref = address(uint160(uint256(topics[2])));
-            _wrappers[keccak256(abi.encode(emitter, ca, ref, caSource, refSource))] =
-                address(uint160(uint256(topics[3])));
+            _wrappers[keccak256(abi.encode(emitter, ca, ref, mode))] = address(uint160(uint256(topics[3])));
         }
     }
 
@@ -85,11 +85,9 @@ contract RegistryMirror {
             require(MarketRegistryLib.recipeKeyHash(recipe) == keyHash, "recipe key not derivable from payload");
             MarketRegistryLib.insertAddress(_recipeKeys, _recipeIndex, recipe);
         } else if (ns == IMarketRegistry.Namespace.Denomination) {
-            (string memory label, address unit) = abi.decode(payload, (string, address));
-            bytes32 labelHash = keccak256(bytes(label));
-            require(labelHash == keyHash, "label hash not derivable from payload");
-            _denominations[labelHash] = unit;
-            MarketRegistryLib.insertBytes32(_denominationKeys, _denominationIndex, labelHash);
+            address unit = abi.decode(payload, (address));
+            require(bytes32(uint256(uint160(unit))) == keyHash, "denomination key not derivable from payload");
+            MarketRegistryLib.insertAddress(_denominationKeys, _denominationIndex, unit);
         }
     }
 
@@ -112,11 +110,9 @@ contract RegistryMirror {
             require(MarketRegistryLib.recipeKeyHash(recipe) == keyHash, "recipe key not derivable from payload");
             MarketRegistryLib.removeAddress(_recipeKeys, _recipeIndex, recipe);
         } else if (ns == IMarketRegistry.Namespace.Denomination) {
-            string memory label = abi.decode(payload, (string));
-            bytes32 labelHash = keccak256(bytes(label));
-            require(labelHash == keyHash, "label hash not derivable from payload");
-            MarketRegistryLib.removeBytes32(_denominationKeys, _denominationIndex, labelHash);
-            delete _denominations[labelHash];
+            address unit = abi.decode(payload, (address));
+            require(bytes32(uint256(uint160(unit))) == keyHash, "denomination key not derivable from payload");
+            MarketRegistryLib.removeAddress(_denominationKeys, _denominationIndex, unit);
         }
     }
 
@@ -146,9 +142,8 @@ contract RegistryMirror {
         return _denominationKeys.length;
     }
 
-    function denominationAt(uint256 i) external view returns (bytes32 labelHash, address unit) {
-        labelHash = _denominationKeys[i];
-        unit = _denominations[labelHash];
+    function denominationAt(uint256 i) external view returns (address) {
+        return _denominationKeys[i];
     }
 
     function recipeCount() external view returns (uint256) {
@@ -159,12 +154,12 @@ contract RegistryMirror {
         return _recipeKeys[i];
     }
 
-    function wrapperFor(address registry, address ca, address ref, address caSource, address refSource)
+    function wrapperFor(address registry, address ca, address ref, IMarketRegistry.OracleMode mode)
         external
         view
         returns (address)
     {
-        return _wrappers[keccak256(abi.encode(registry, ca, ref, caSource, refSource))];
+        return _wrappers[keccak256(abi.encode(registry, ca, ref, uint8(mode)))];
     }
 }
 
@@ -173,7 +168,7 @@ contract RegistryMirror {
 /// @dev One scenario drives every store through both verbs and through the paths that are easy to
 ///      get wrong — swap-and-pop removal, a label re-pointed by remove-then-add, an asset whose
 ///      absent source slot arrives full of junk, and a `deploy` whose wrapper key is built from
-///      resolved sources rather than from the pair.
+///      the mode and the resolved wiring rather than from the pair alone.
 ///
 ///      The comparison is deliberately made against the registry's ENUMERATION, not against a
 ///      hand-written expectation. A test that lists what it expects proves the scenario; comparing
@@ -187,7 +182,7 @@ contract EventReplayTest is RegistryFixture {
     address internal tokD;
     address internal vault;
     address internal gbpUnit;
-    address internal gbpUnitRepointed;
+    address internal gbpUnitReplacement;
     address internal wrapper;
 
     /// @dev Two contracts to approve as recipes. `addRecipes` only requires code at the address, so
@@ -198,9 +193,10 @@ contract EventReplayTest is RegistryFixture {
 
     // ── the scenario ───────────────────────────────────────────────────────────
 
-    /// @dev Recording starts BEFORE the registry exists, because the constructor seeds `"USD"` and
-    ///      `"ETH"` into the denomination store and those two writes are part of the state a replay
-    ///      has to account for. An indexer starting at the deployment block sees them; so does this.
+    /// @dev Recording starts BEFORE the registry exists, because `initialize` seeds the US Dollar and
+    ///      Ether pseudo-units into the denomination store and those two writes are part of the state a
+    ///      replay has to account for. An indexer starting at the deployment block sees them; so does
+    ///      this.
     function setUp() public {
         vm.recordLogs();
 
@@ -213,9 +209,9 @@ contract EventReplayTest is RegistryFixture {
         // Feeds and denominations first — every source an asset names is validated on the way in.
         _addEthUsdFeed();
         gbpUnit = makeAddr("gbpUnit");
-        gbpUnitRepointed = makeAddr("gbpUnitRepointed");
-        _registerDenominationWithUsdFeed("GBP", gbpUnit, makeAddr("gbpUsdAggregator"));
-        _addFeed(USD_UNIT, ETH_UNIT, makeAddr("usdEthAggregator"), 8);
+        gbpUnitReplacement = makeAddr("gbpUnitReplacement");
+        _registerDenominationWithUsdFeed(gbpUnit, makeAddr("gbpUsdAggregator"));
+        _addFeed(USD_UNIT, ETH_UNIT, makeAddr("usdEthAggregator"));
 
         tokA = _newToken("AAA", 6);
         tokB = _newToken("BBB", 18);
@@ -225,22 +221,22 @@ contract EventReplayTest is RegistryFixture {
 
         // Four assets in ONE batch: four separate `EntryAdded` logs, not one for the call.
         IMarketRegistry.Asset[] memory batch = new IMarketRegistry.Asset[](4);
-        batch[0] = mkPriceOnlyAsset(tokA, "ALPHA", tokA, "USD");
-        batch[1] = mkPriceOnlyAsset(tokB, "BRAVO", tokB, "USD");
-        batch[2] = mkDualSourceAsset(tokC, "CHARLIE", tokC, "USD", vault, "GBP");
+        batch[0] = mkPriceOnlyAsset(tokA, "ALPHA", tokA, USD_UNIT);
+        batch[1] = mkPriceOnlyAsset(tokB, "BRAVO", tokB, USD_UNIT);
+        batch[2] = mkDualSourceAsset(tokC, "CHARLIE", tokC, USD_UNIT, vault, gbpUnit);
         batch[3] = _junkAbsentSourceAsset(tokD, "DELTA");
         iReg.addAssets(batch);
 
         // A wrapper, so the deploy record is in the replay too.
-        wrapper = iReg.deploy(tokA, tokB, IMarketRegistry.OracleMode.PRICE);
+        wrapper = iReg.deploy(tokA, tokB, IMarketRegistry.OracleMode.PRICE, bytes32(0));
 
         // Now the removals — each one exercises swap-and-pop in a different store.
         iReg.removeAssets(one(tokB)); // DELTA swaps into BRAVO's slot
         iReg.removeConversionFeeds(one(gbpUnit), one(USD_UNIT));
 
-        // A label re-pointed the only way the registry allows: remove, then add.
-        iReg.removeDenominations(one("GBP"));
-        iReg.addDenominations(one("GBP"), one(gbpUnitRepointed));
+        // A unit swapped for another the only way the registry allows: remove one, add the other.
+        iReg.removeDenominations(one(gbpUnit));
+        iReg.addDenominations(one(gbpUnitReplacement));
 
         address[] memory recipes = new address[](2);
         recipes[0] = recipeOne;
@@ -252,19 +248,15 @@ contract EventReplayTest is RegistryFixture {
     }
 
     /// @dev An asset whose ABSENT price slot carries a live-looking `sourceType`, `sourceInterface`
-    ///      and denomination. All three are legal on the way in — presence is `addr != 0`, so nothing
+    ///      and denomination unit. All three are legal on the way in — presence is `addr != 0`, so nothing
     ///      validates a slot that is not there — and all three are discarded by the write. It exists
     ///      to pin that the LOG reports what was stored rather than what was submitted.
-    function _junkAbsentSourceAsset(address addr, string memory name)
-        internal
-        pure
-        returns (IMarketRegistry.Asset memory)
-    {
+    function _junkAbsentSourceAsset(address addr, string memory name) internal returns (IMarketRegistry.Asset memory) {
         IMarketRegistry.AssetSource memory junk = IMarketRegistry.AssetSource({
             addr: address(0),
             sourceType: IMarketRegistry.SourceType.NAV,
             sourceInterface: IMarketRegistry.SourceInterface.ERC4626,
-            denomination: "NOT-A-REGISTERED-LABEL"
+            denomination: makeAddr("notARegisteredUnit")
         });
         return mkAsset(addr, name, IMarketRegistry.AssetKind.ERC20, junk, noSource());
     }
@@ -336,25 +328,22 @@ contract EventReplayTest is RegistryFixture {
             assertEq(got.base, page[i].base, string.concat(tag, ": base"));
             assertEq(got.quote, page[i].quote, string.concat(tag, ": quote"));
             assertEq(got.aggregatorAddress, page[i].aggregatorAddress, string.concat(tag, ": aggregator"));
-            assertEq(uint256(got.feedDecimals), uint256(page[i].feedDecimals), string.concat(tag, ": decimals"));
         }
     }
 
-    /// @notice Denominations, including the two the constructor seeded and the label re-pointed by a
+    /// @notice Denominations, including the two `initialize` seeded and the unit swapped by a
     ///         remove-then-add pair.
     function test_replay_rebuildsDenominations() public view {
-        (IMarketRegistry.Denomination[] memory page, uint256 total) = iReg.getDenominations(0, 100);
+        (address[] memory page, uint256 total) = iReg.getDenominations(0, 100);
         assertEq(mirror.denominationCount(), total, "denomination count diverged");
 
         for (uint256 i = 0; i < total; ++i) {
-            (bytes32 labelHash, address unit) = mirror.denominationAt(i);
-            assertEq(labelHash, page[i].labelHash, string.concat("denomination ", vm.toString(i), ": hash"));
-            assertEq(unit, page[i].unit, string.concat("denomination ", vm.toString(i), ": unit"));
+            assertEq(mirror.denominationAt(i), page[i], string.concat("denomination ", vm.toString(i), ": unit"));
         }
 
-        // The re-point landed on both sides, and on the NEW unit.
-        (, address live) = iReg.lookupDenomination("GBP");
-        assertEq(live, gbpUnitRepointed, "registry must report the re-pointed unit");
+        // The swap landed on both sides: the old unit is gone and the new one is registered.
+        assertFalse(iReg.isDenomination(gbpUnit), "registry must have dropped the removed unit");
+        assertTrue(iReg.isDenomination(gbpUnitReplacement), "registry must report the newly added unit");
     }
 
     /// @notice Recipes come back as ADDRESSES, which the old hash-only event made impossible.
@@ -369,25 +358,28 @@ contract EventReplayTest is RegistryFixture {
         assertEq(page[0], recipeTwo, "the survivor must be the one that was not removed");
     }
 
-    /// @notice The wrapper record is keyed on the two RESOLVED sources, and the log now carries them.
+    /// @notice The wrapper record is replayable by (pair, mode) — the identity the log carries. The
+    ///         registry's own key folds in live wiring, so it is a view rather than something to rebuild.
     function test_replay_rebuildsWrapperRecord() public view {
-        // Both legs are price-only assets whose source is the token itself, so the sources echo the
-        // pair — but the mirror learned that from the event, not from this test.
-        assertEq(mirror.wrapperFor(address(reg), tokA, tokB, tokA, tokB), wrapper, "wrapper record not replayable");
+        assertEq(
+            mirror.wrapperFor(address(reg), tokA, tokB, IMarketRegistry.OracleMode.PRICE),
+            wrapper,
+            "wrapper record not replayable"
+        );
         assertTrue(wrapper != address(0), "scenario must have deployed a wrapper");
     }
 
     /// @notice An absent source arrives full of junk and is stored as zeros — and the LOG says zeros.
-    /// @dev Without this the replay would rebuild `DELTA` with a `NAV` price slot quoting a label that
+    /// @dev Without this the replay would rebuild `DELTA` with a `NAV` price slot quoting a unit that
     ///      was never registered, and every downstream consumer would inherit that fiction.
     function test_replay_absentSourceIsReportedAsStoredNotAsSubmitted() public view {
         (, IMarketRegistry.Asset memory stored) = iReg.lookupAssetByAddress(tokD);
-        assertEq(stored.priceSource.denomination, "", "registry must zero an absent slot");
+        assertEq(stored.priceSource.denomination, address(0), "registry must zero an absent slot");
 
         IMarketRegistry.Asset memory replayed = mirror.assetByName("DELTA");
         assertEq(replayed.addr, tokD, "DELTA missing from the replay");
         assertEq(replayed.priceSource.addr, address(0), "absent slot must replay as absent");
-        assertEq(replayed.priceSource.denomination, "", "junk denomination leaked into the log");
+        assertEq(replayed.priceSource.denomination, address(0), "junk denomination leaked into the log");
         assertEq(
             uint256(uint8(replayed.priceSource.sourceType)),
             uint256(uint8(IMarketRegistry.SourceType.PRICE)),

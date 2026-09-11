@@ -68,7 +68,6 @@ contract StoreEngineTest is Test {
         f.base = FEED_BASE;
         f.quote = _quoteOf(slot);
         f.aggregatorAddress = makeAddr(string(abi.encodePacked("agg", slot)));
-        f.feedDecimals = 8;
         vm.prank(owner);
         reg.addConversionFeeds(one(f));
         expectedSlots.push(slot);
@@ -212,7 +211,6 @@ contract StoreEngineTest is Test {
         assertEq(f.base, address(0), "base not zeroed");
         assertEq(f.quote, address(0), "quote not zeroed");
         assertEq(f.aggregatorAddress, address(0), "aggregator not zeroed");
-        assertEq(uint256(f.feedDecimals), 0, "decimals not zeroed");
     }
 
     /// @dev The asset-level `denomination` field is GONE, so there is no single string to check for
@@ -224,9 +222,9 @@ contract StoreEngineTest is Test {
         assertEq(a.addr, address(0), "addr not zeroed");
         assertEq(a.name, "", "name not zeroed");
         assertEq(a.priceSource.addr, address(0), "price source addr not zeroed");
-        assertEq(a.priceSource.denomination, "", "price source denomination not zeroed");
+        assertEq(a.priceSource.denomination, address(0), "price source denomination not zeroed");
         assertEq(a.navSource.addr, address(0), "nav source addr not zeroed");
-        assertEq(a.navSource.denomination, "", "nav source denomination not zeroed");
+        assertEq(a.navSource.denomination, address(0), "nav source denomination not zeroed");
     }
 
     /// @notice An unregistered pair reads `address(0)` from `lookupWrapper` in BOTH modes — never

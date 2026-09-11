@@ -65,7 +65,8 @@ contract WrapperRateConsumerFactory is IWrapperRateConsumerFactory, Initializabl
     /// @dev The idempotency record. `createWrapperRateConsumer` is public and both of its deployments
     ///      are CREATE2, so without this a front-runner who mirrors a registry's arguments would make
     ///      every later identical call revert forever on the salt collision. Recording the wrapper
-    ///      under the full argument set turns that replay into a read.
+    ///      under the canonical argument set (vault-side decimals as derived, not as typed) turns that
+    ///      replay into a read.
     mapping(bytes32 paramsHash => address wrapper) public wrapperByParams;
 
     /// @notice One-time setup, called in the deployment transaction by the `AtomicDeployer`.
@@ -120,9 +121,17 @@ contract WrapperRateConsumerFactory is IWrapperRateConsumerFactory, Initializabl
         bytes32 morphoSalt,
         bytes32 wrapperSalt
     ) internal returns (address wrapper, address oracle) {
-        // Idempotency first: a byte-identical repeat call — including a front-runner's mirror of the
-        // arguments a registry is about to pass — gets the already-built pair back instead of
-        // replaying the spent CREATE2 salts and reverting. No write, no event on this path.
+        // Hash the decimals the factory actually passes to Morpho, not the ones the caller typed. A
+        // vault side ignores the caller's value and reads the vault, so two calls that differ only in
+        // that ignored value build the SAME oracle and wrapper. If the key hashed the raw value, the
+        // second of those calls would miss the cache and replay the spent CREATE2 salts.
+        baseTokenDecimals = _underlyingDecimals(baseVault, baseTokenDecimals);
+        quoteTokenDecimals = _underlyingDecimals(quoteVault, quoteTokenDecimals);
+
+        // Idempotency first: a repeat call with the same canonical arguments — including a
+        // front-runner's mirror of the arguments a registry is about to pass — gets the already-built
+        // pair back instead of replaying the spent CREATE2 salts and reverting. No write, no event on
+        // this path.
         bytes32 paramsHash = keccak256(
             abi.encode(
                 baseVault,
@@ -146,7 +155,8 @@ contract WrapperRateConsumerFactory is IWrapperRateConsumerFactory, Initializabl
             }
         }
 
-        // Step 1: create the underlying Morpho oracle through the configured factory — UNDERLYING decimals.
+        // Step 1: create the underlying Morpho oracle through the configured factory — UNDERLYING decimals
+        // (derived above).
         oracle = _createMorphoOracle(
             baseVault,
             baseVaultConversionSample,
@@ -161,7 +171,8 @@ contract WrapperRateConsumerFactory is IWrapperRateConsumerFactory, Initializabl
             morphoSalt
         );
 
-        // Step 2: deploy the wrapper around the freshly-created oracle — SHARE decimals.
+        // Step 2: deploy the wrapper around the freshly-created oracle — SHARE decimals. A vault side derives
+        // them from the vault; a no-vault side's derived value equals the caller's, so the fallback is intact.
         wrapper = _deployWrapper(oracle, wrapperSalt, baseTokenDecimals, quoteTokenDecimals);
 
         wrapperByParams[paramsHash] = wrapper;
@@ -170,9 +181,10 @@ contract WrapperRateConsumerFactory is IWrapperRateConsumerFactory, Initializabl
         emit CreateWrapperRateConsumer(msg.sender, wrapper, oracle);
     }
 
-    /// @notice Creates the underlying `MorphoChainlinkOracleV2` with each side's UNDERLYING decimals.
-    /// @dev Split out of `_createWrapperRateConsumer` so the per-side `_underlyingDecimals` reads run in a smaller
-    ///      stack frame than the 12-argument shared path would allow without via-IR.
+    /// @notice Creates the underlying `MorphoChainlinkOracleV2` with each side's UNDERLYING decimals, already
+    ///         derived by the caller.
+    /// @dev Split out of `_createWrapperRateConsumer` so the eleven-argument Morpho call runs in a smaller stack
+    ///      frame than the 12-argument shared path would allow without via-IR.
     function _createMorphoOracle(
         IERC4626 baseVault,
         uint256 baseVaultConversionSample,
@@ -186,20 +198,17 @@ contract WrapperRateConsumerFactory is IWrapperRateConsumerFactory, Initializabl
         uint256 quoteTokenDecimals,
         bytes32 morphoSalt
     ) private returns (address) {
-        uint256 underlyingBaseDecimals = _underlyingDecimals(baseVault, baseTokenDecimals);
-        uint256 underlyingQuoteDecimals = _underlyingDecimals(quoteVault, quoteTokenDecimals);
-
         return MORPHO_FACTORY.createMorphoChainlinkOracleV2(
             baseVault,
             baseVaultConversionSample,
             baseFeed1,
             baseFeed2,
-            underlyingBaseDecimals,
+            baseTokenDecimals,
             quoteVault,
             quoteVaultConversionSample,
             quoteFeed1,
             quoteFeed2,
-            underlyingQuoteDecimals,
+            quoteTokenDecimals,
             morphoSalt
         );
     }
@@ -246,7 +255,7 @@ contract WrapperRateConsumerFactory is IWrapperRateConsumerFactory, Initializabl
     }
 
     /// @notice The side's SHARE decimals — what the `WrapperRateConsumer` normalizes against (Morpho's `price()`
-    ///         carries the SHARE-decimal scale; see guides/oracle-decimals.md §2).
+    ///         carries the SHARE-decimal scale).
     /// @dev For a vault side, read `vault.decimals()` (the ERC-4626 share decimals). For a no-vault side, fall back
     ///      to the caller-supplied token decimals (no share/underlying split exists there).
     function _shareDecimals(IERC4626 vault, uint256 tokenDecimals) private view returns (uint256) {
@@ -256,6 +265,6 @@ contract WrapperRateConsumerFactory is IWrapperRateConsumerFactory, Initializabl
 
     /// @inheritdoc IVersion
     function version() external pure returns (string memory) {
-        return "0.3.0";
+        return "0.3.1";
     }
 }

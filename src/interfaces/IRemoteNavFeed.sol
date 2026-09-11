@@ -37,6 +37,16 @@ interface IRemoteNavFeed {
     error UnknownResponse(uint80 roundId);
     /// @notice Deployment was attempted with a gas allowance below MIN_GAS_ALLOWANCE.
     error GasAllowanceTooLow(uint128 gasAllowance);
+    /// @notice Deployment was attempted with a staleness bound above MAX_STALENESS_CEILING.
+    error MaxStalenessTooHigh(uint256 maxStaleness);
+    /// @notice Deployment was attempted with the zero address as read library.
+    error ZeroReadLibrary();
+    /// @notice Deployment was attempted with no verifier configuration.
+    error EmptyReadConfig();
+    /// @notice `skipStuckRound` found no round at the endpoint's next inbound nonce.
+    error UnknownRound(uint80 roundId);
+    /// @notice `skipStuckRound` was called before the stuck round reached SKIP_TIMEOUT.
+    error RoundNotStuck(uint80 roundId);
 
     /// @notice Chainlink convention: a new round was started.
     event NewRound(uint256 indexed roundId, address indexed startedBy, uint256 startedAt);
@@ -44,6 +54,10 @@ interface IRemoteNavFeed {
     event AnswerUpdated(int256 indexed current, uint256 indexed roundId, uint256 updatedAt);
     /// @notice A round was answered but does not become latest; kept in history.
     event AnswerRecorded(int256 answer, uint256 indexed roundId, uint256 updatedAt);
+    /// @notice A round whose response never verified was skipped on the endpoint.
+    ///         The round record stays in history, unanswered, so readers can tell
+    ///         "definitively dead" from "possibly in flight".
+    event RoundSkipped(uint256 indexed roundId, address indexed skippedBy);
 
     struct Round {
         int256 answer;
@@ -64,6 +78,18 @@ interface IRemoteNavFeed {
 
     /// @notice Quote the native fee for `refresh`.
     function quoteRefresh() external view returns (MessagingFee memory);
+
+    /// @notice Unstick the feed after a response that never verified. LayerZero
+    ///         delivers in verification order, so one response that is never
+    ///         verified blocks every later response; retrying `refresh` only
+    ///         queues more behind it. Anyone can call. The endpoint names the
+    ///         target (its next inbound nonce) and the feed's own state
+    ///         authorizes the skip: the round must exist, be unanswered, and be
+    ///         older than SKIP_TIMEOUT. Under those conditions the message being
+    ///         destroyed is one nobody wants, so no owner or delegate is needed.
+    ///         Reverts with UnknownRound, RoundAlreadyAnswered or RoundNotStuck
+    ///         otherwise. Skipping a run of stuck rounds takes one call per round.
+    function skipStuckRound() external;
 
     /// @notice The exact executor options every `refresh` uses: a type-3 container
     ///         with a single lzRead executor option carrying GAS_ALLOWANCE and
@@ -89,6 +115,11 @@ interface IRemoteNavFeed {
     /// @notice An unanswered round blocks new rounds until this much time passes.
     ///         Bounds the damage of a lost response: the feed pauses, never bricks.
     function ROUND_TIMEOUT() external view returns (uint256);
+
+    /// @notice How old an unanswered round must be before `skipStuckRound` may
+    ///         destroy its response. Well above ROUND_TIMEOUT, so a merely slow
+    ///         response is never skipped.
+    function SKIP_TIMEOUT() external view returns (uint256);
 
     /// @notice Byte size of the lens response: the abi.encoding of five 32-byte
     ///         words (sample, assets, assetDecimals, blockNumber, timestamp).
@@ -125,5 +156,18 @@ interface IRemoteNavFeed {
     /// @notice Max age of the served reading, measured from its source-chain
     ///         timestamp, before `latestRoundData` fails closed. Chosen per feed
     ///         at deployment and part of the feed's identity (CREATE2 salt).
+    ///         Never above MAX_STALENESS_CEILING, so the staleness check cannot
+    ///         overflow.
     function MAX_STALENESS() external view returns (uint256);
+
+    /// @notice Upper bound on MAX_STALENESS, enforced at deployment.
+    function MAX_STALENESS_CEILING() external view returns (uint256);
+
+    /// @notice The LayerZero read library the feed registered on the endpoint at
+    ///         deployment as both its send and receive library for READ_CHANNEL.
+    ///         The feed has no owner and no delegate, so this and the verifier
+    ///         configuration applied to it can never change. Both are part of
+    ///         the feed's identity (CREATE2 salt); read the applied verifier set
+    ///         from `ENDPOINT.getConfig(feed, READ_LIBRARY, READ_CHANNEL, ...)`.
+    function READ_LIBRARY() external view returns (address);
 }

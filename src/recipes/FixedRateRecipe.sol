@@ -81,13 +81,14 @@ contract FixedRateRecipe is IMarketRecipe, Initializable, IVersion {
     ///      instance without one could never accept anything.
     error ZeroRegistry();
 
-    /// @notice Thrown by `resolve` when `additionalData` is not empty.
+    /// @notice Thrown by `resolve` and {decodeExtraData} when `extraData` is not empty.
     /// @dev `resolve` reverts where `verify` returns false, and the asymmetry is deliberate: `resolve`
     ///      is called off-chain by the agent BUILDING the order, so a loud failure there is a bug
     ///      report delivered at the moment the mistake is made. `verify` is called on-chain by
     ///      `CorkLimitOrderAdapter`, which owns the revert and its selector — see `IMarketRecipe.verify`.
-    /// @param length The `additionalData` length that was supplied.
-    error UnexpectedAdditionalData(uint256 length);
+    ///      Both paths decide through {_hasValidExtraData}, so the rule lives in one place.
+    /// @param length The `extraData` length that was supplied.
+    error UnexpectedExtraData(uint256 length);
 
     /// @notice Thrown when the caller supplied no rate oracle (`rateOracle` is zero).
     /// @dev A revert, not a `false`, and that is the interface's own rule: `false` means the constraint
@@ -146,7 +147,37 @@ contract FixedRateRecipe is IMarketRecipe, Initializable, IVersion {
     function description() external view override returns (string memory) {
         return "Fixed rate: the market's rate is whatever immutable FixedRateOracle the order names, "
             "and it can never move. Requires that oracle to come from this registry's fixed-rate "
-            "factory and that both rate-change allowances are zero. Takes no additionalData.";
+            "factory and that both rate-change allowances are zero. Takes no extraData: "
+            "encodeExtraData() returns empty bytes and decodeExtraData() accepts only empty bytes.";
+    }
+
+    // ─────────────────────────────── extraData ─────────────────────────
+
+    /// @notice The `extraData` this recipe expects, which is none.
+    /// @return The empty payload to pass as `extraData` to {resolve} and {verify}.
+    function encodeExtraData() external pure returns (bytes memory) {
+        return "";
+    }
+
+    /// @notice Checks that `extraData` is the payload this recipe expects, which is none.
+    /// @dev The deployed recipe is the layout oracle: off-chain callers check their payload here
+    ///      before signing. Returns nothing, because there is nothing to decode; its only job is to
+    ///      reject a payload this recipe would ignore, with the same selector {resolve} uses.
+    /// @param extraData The payload to check. Must be empty.
+    function decodeExtraData(bytes calldata extraData) external pure {
+        _decodeExtraData(extraData);
+    }
+
+    /// @dev The one rule for `extraData`: this recipe reads none, so carrying any is a
+    ///      mismatch, not a courtesy. {verify} consults this directly so it can return `false`
+    ///      as the interface requires; {_decodeExtraData} turns the same verdict into a revert.
+    function _hasValidExtraData(bytes calldata extraData) internal pure returns (bool) {
+        return extraData.length == 0;
+    }
+
+    /// @dev The reverting form of {_hasValidExtraData}, shared by {resolve} and {decodeExtraData}.
+    function _decodeExtraData(bytes calldata extraData) internal pure {
+        if (!_hasValidExtraData(extraData)) revert UnexpectedExtraData(extraData.length);
     }
 
     /// @inheritdoc IMarketRecipe
@@ -165,13 +196,14 @@ contract FixedRateRecipe is IMarketRecipe, Initializable, IVersion {
     ///      single source of truth.
     ///
     ///      `ca` and `ref` are unused: a fixed rate is a number, not a relationship between two assets.
-    function resolve(address ca, address ref, address rateOracle, bytes calldata additionalData)
+    ///      `extraData` must be what {encodeExtraData} returns, which is nothing.
+    function resolve(address ca, address ref, address rateOracle, bytes calldata extraData)
         external
         view
         override
         returns (IMarketRegistry.ResolvedConstraint memory constraint)
     {
-        if (additionalData.length != 0) revert UnexpectedAdditionalData(additionalData.length);
+        _decodeExtraData(extraData);
         if (rateOracle == address(0)) revert RateOracleNotDeployed(ca, ref);
 
         uint256 rate = IRateOracle(rateOracle).rate();
@@ -214,11 +246,12 @@ contract FixedRateRecipe is IMarketRecipe, Initializable, IVersion {
         address ca,
         address ref,
         address rateOracle,
+        uint256, /* expiryTimestamp: a fixed rate does not depend on the market's life */
+        bool, /* creating */
         IMarketRegistry.ResolvedConstraint calldata constraint,
-        bytes calldata additionalData
+        bytes calldata extraData
     ) external view override returns (bool) {
-        // This recipe reads no `additionalData`, so carrying any is a mismatch, not a courtesy.
-        if (additionalData.length != 0) return false;
+        if (!_hasValidExtraData(extraData)) return false;
 
         if (rateOracle == address(0)) revert RateOracleNotDeployed(ca, ref);
 

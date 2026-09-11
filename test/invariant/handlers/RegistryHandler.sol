@@ -4,6 +4,7 @@ import {Test} from "forge-std/Test.sol";
 
 import {FixedRateOracleFactory} from "../../../src/FixedRateOracleFactory.sol";
 import {MarketRegistry} from "../../../src/MarketRegistry.sol";
+import {MarketRegistryLib} from "../../../src/MarketRegistryLib.sol";
 import {IMarketRegistry} from "../../../src/interfaces/IMarketRegistry.sol";
 import {
     mkDualSourceAsset,
@@ -29,7 +30,7 @@ import {one} from "../../helpers/ArrayHelpers.sol";
 ///         `deploy(ca, ref, mode)` takes two REGISTERED assets and reads their live `decimals()`, so this
 ///         handler keeps a small POOL of {MockToken} assets registered and PROTECTED from removal and
 ///         from source mutation, guaranteeing `deploy` always has valid targets. Every deploy runs
-///         through one deterministic {MockWrapperFactory}, so a given (pair, resolved-sources)
+///         through one deterministic {MockWrapperFactory}, so a given (pair, mode, wiring)
 ///         combination lands at a stable wrapper — and a repeat deploy of the same combination is an
 ///         idempotent no-op that returns the recorded address.
 ///
@@ -52,8 +53,8 @@ import {one} from "../../helpers/ArrayHelpers.sol";
 ///      2. **The registry constructor takes THREE arguments** — owner, wrapper factory, fixed-rate
 ///         oracle factory — and zero-checks both factories, so the handler deploys a real
 ///         {FixedRateOracleFactory} alongside the mock wrapper factory.
-///      3. **`deploy` takes an `OracleMode`** and wrappers are keyed by `(registry, ca, ref, caSource,
-///         refSource)`, so one pair can hold a NAV wrapper AND a price wrapper at once. The ghost pair
+///      3. **`deploy` takes an `OracleMode`** and wrappers are keyed by `(registry, ca, ref, mode,
+///         wiring)`, so one pair can hold a NAV wrapper AND a price wrapper at once. The ghost pair
 ///         record therefore carries the MODE, and `lookupWrapper` is asked for it.
 ///      4. **The denomination lives on each SOURCE**, is validated at write time, and there is no
 ///         asset-level field. Every source this handler builds quotes `"USD"`, which the registry
@@ -75,12 +76,12 @@ contract RegistryHandler is Test {
     ///      this handler calls it — it exists because the registry refuses a zero one.
     FixedRateOracleFactory public fixedRateOracleFactory;
 
-    /// @notice The denomination label every source this handler builds quotes in.
-    /// @dev `"USD"` is seeded by the registry constructor and its unit IS the US Dollar sentinel, so
+    /// @notice The denomination unit every source this handler builds quotes in.
+    /// @dev The US Dollar sentinel is seeded by `initialize` and IS the walk's terminus, so
     ///      `resolvePath` returns an empty path and no conversion feed has to exist for a write to
     ///      succeed. Using anything else would couple every asset add to the feed store the fuzzer is
     ///      simultaneously adding to and removing from.
-    string internal constant DENOM = "USD";
+    address internal constant DENOM = MarketRegistryLib.USD_DENOMINATION;
 
     // Bounded universes.
     uint256 internal constant ASSET_POOL = 24;
@@ -325,7 +326,7 @@ contract RegistryHandler is Test {
         address ca = _deployPool[bound(seed, 0, n - 1)];
         address ref = _deployPool[bound(seed / 7, 0, n - 1)];
         IMarketRegistry.OracleMode mode = IMarketRegistry.OracleMode(bound(modeSeed, 0, 1));
-        try ireg.deploy(ca, ref, mode) returns (address w) {
+        try ireg.deploy(ca, ref, mode, bytes32(0)) returns (address w) {
             deployCalls++;
             // Record the triple→wrapper the first time it deploys; a repeat is an idempotent no-op that
             // returns the same recorded address.
@@ -406,7 +407,7 @@ contract RegistryHandler is Test {
         pure
         returns (IMarketRegistry.ConversionFeed memory e)
     {
-        e = mkFeed(base, quote, _poolAddr("agg", slot), 8);
+        e = mkFeed(base, quote, _poolAddr("agg", slot));
     }
 
     // ═════════════════════════════════════════════════════════════════════════════

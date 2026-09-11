@@ -57,7 +57,7 @@ contract ConversionFeedTest is Test {
 
     // ── helpers ────────────────────────────────────────────────────────────────
 
-    function _feed(address base, address quote, address agg, uint8 dec)
+    function _feed(address base, address quote, address agg)
         internal
         pure
         returns (IMarketRegistry.ConversionFeed memory f)
@@ -65,7 +65,6 @@ contract ConversionFeedTest is Test {
         f.base = base;
         f.quote = quote;
         f.aggregatorAddress = agg;
-        f.feedDecimals = dec;
     }
 
     function _feedKey(address base, address quote) internal pure returns (bytes32) {
@@ -81,7 +80,7 @@ contract ConversionFeedTest is Test {
 
     function test_addConversionFeeds_happyPath_storesAndIndexes() public {
         address agg = makeAddr("agg");
-        IMarketRegistry.ConversionFeed memory f = _feed(CHAINLINK_ETH, CHAINLINK_USD, agg, 8);
+        IMarketRegistry.ConversionFeed memory f = _feed(CHAINLINK_ETH, CHAINLINK_USD, agg);
 
         vm.expectEmit(true, true, false, true, address(registry));
         emit IMarketRegistry.EntryAdded(NS_FEED, _feedKey(CHAINLINK_ETH, CHAINLINK_USD), abi.encode(f));
@@ -92,51 +91,38 @@ contract ConversionFeedTest is Test {
         assertEq(got.base, CHAINLINK_ETH, "base mismatch");
         assertEq(got.quote, CHAINLINK_USD, "quote mismatch");
         assertEq(got.aggregatorAddress, agg, "aggregator mismatch");
-        assertEq(uint256(got.feedDecimals), 8, "decimals mismatch");
 
         (, uint256 total) = reg.getConversionFeeds(0, 10);
         assertEq(total, 1, "total should be 1");
     }
 
     function test_addConversionFeeds_zeroBase_reverts() public {
-        IMarketRegistry.ConversionFeed memory f = _feed(address(0), CHAINLINK_USD, makeAddr("agg"), 8);
+        IMarketRegistry.ConversionFeed memory f = _feed(address(0), CHAINLINK_USD, makeAddr("agg"));
         vm.expectRevert(IMarketRegistry.ZeroAddress.selector);
         _addFeed(f);
     }
 
     function test_addConversionFeeds_zeroQuote_reverts() public {
-        IMarketRegistry.ConversionFeed memory f = _feed(CHAINLINK_ETH, address(0), makeAddr("agg"), 8);
+        IMarketRegistry.ConversionFeed memory f = _feed(CHAINLINK_ETH, address(0), makeAddr("agg"));
         vm.expectRevert(IMarketRegistry.ZeroAddress.selector);
         _addFeed(f);
     }
 
     function test_addConversionFeeds_zeroAggregator_reverts() public {
-        IMarketRegistry.ConversionFeed memory f = _feed(CHAINLINK_ETH, CHAINLINK_USD, address(0), 8);
+        IMarketRegistry.ConversionFeed memory f = _feed(CHAINLINK_ETH, CHAINLINK_USD, address(0));
         vm.expectRevert(IMarketRegistry.ZeroAddress.selector);
         _addFeed(f);
     }
 
     function test_addConversionFeeds_duplicateNaturalKey_reverts() public {
-        IMarketRegistry.ConversionFeed memory f = _feed(CHAINLINK_ETH, CHAINLINK_USD, makeAddr("agg"), 8);
+        IMarketRegistry.ConversionFeed memory f = _feed(CHAINLINK_ETH, CHAINLINK_USD, makeAddr("agg"));
         _addFeed(f);
 
-        // Same (base, quote); a differing aggregator/decimals must NOT matter — the natural key is
+        // Same (base, quote); a differing aggregator must NOT matter — the natural key is
         // only the address pair.
-        IMarketRegistry.ConversionFeed memory dup = _feed(CHAINLINK_ETH, CHAINLINK_USD, makeAddr("agg2"), 18);
+        IMarketRegistry.ConversionFeed memory dup = _feed(CHAINLINK_ETH, CHAINLINK_USD, makeAddr("agg2"));
         vm.expectRevert(IMarketRegistry.EntryAlreadyExists.selector);
         _addFeed(dup);
-    }
-
-    /// @notice `feedDecimals` is recorded verbatim, never validated against a live aggregator
-    ///         `decimals()`. An arbitrary out-of-band value stores and reads back.
-    function test_addConversionFeeds_feedDecimalsRecordedNotValidated() public {
-        // The aggregator has no code and could never answer decimals(); the add still succeeds.
-        IMarketRegistry.ConversionFeed memory f = _feed(CHAINLINK_ETH, CHAINLINK_USD, makeAddr("agg"), 255);
-        _addFeed(f);
-
-        (bool found, IMarketRegistry.ConversionFeed memory got) = reg.lookupConversionFeed(CHAINLINK_ETH, CHAINLINK_USD);
-        assertTrue(found, "feed not found");
-        assertEq(uint256(got.feedDecimals), 255, "feedDecimals must be recorded verbatim");
     }
 
     /// @notice DIRECTION is part of the identity: `(base, quote)` and `(quote, base)` are two separate
@@ -145,8 +131,8 @@ contract ConversionFeedTest is Test {
     ///      `resolvePath` probes forward edges only, so approving `ETH → USD` does NOT make
     ///      `USD → ETH` usable, and a pair needing the inverse has to have the inverse approved.
     function test_addConversionFeeds_directionIsPartOfTheKey_bothStored() public {
-        _addFeed(_feed(CHAINLINK_ETH, CHAINLINK_USD, makeAddr("aggForward"), 8));
-        _addFeed(_feed(CHAINLINK_USD, CHAINLINK_ETH, makeAddr("aggInverse"), 18));
+        _addFeed(_feed(CHAINLINK_ETH, CHAINLINK_USD, makeAddr("aggForward")));
+        _addFeed(_feed(CHAINLINK_USD, CHAINLINK_ETH, makeAddr("aggInverse")));
 
         (bool forwardFound, IMarketRegistry.ConversionFeed memory forward) =
             reg.lookupConversionFeed(CHAINLINK_ETH, CHAINLINK_USD);
@@ -163,7 +149,7 @@ contract ConversionFeedTest is Test {
     }
 
     function test_addConversionFeeds_nonOwner_reverts() public {
-        IMarketRegistry.ConversionFeed memory f = _feed(CHAINLINK_ETH, CHAINLINK_USD, makeAddr("agg"), 8);
+        IMarketRegistry.ConversionFeed memory f = _feed(CHAINLINK_ETH, CHAINLINK_USD, makeAddr("agg"));
         vm.prank(stranger);
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, stranger));
         reg.addConversionFeeds(one(f));
@@ -172,8 +158,8 @@ contract ConversionFeedTest is Test {
     // ── removeConversionFeed ──────────────────────────────────────────────────────
 
     function test_removeConversionFeeds_happyPath_swapAndPop() public {
-        _addFeed(_feed(CHAINLINK_ETH, CHAINLINK_USD, makeAddr("agg1"), 8));
-        _addFeed(_feed(CHAINLINK_USD, CHAINLINK_ETH, makeAddr("agg2"), 18));
+        _addFeed(_feed(CHAINLINK_ETH, CHAINLINK_USD, makeAddr("agg1")));
+        _addFeed(_feed(CHAINLINK_USD, CHAINLINK_ETH, makeAddr("agg2")));
 
         vm.expectEmit(true, true, false, true, address(registry));
         emit IMarketRegistry.EntryRemoved(
@@ -200,7 +186,7 @@ contract ConversionFeedTest is Test {
     }
 
     function test_removeConversionFeeds_nonOwner_reverts() public {
-        _addFeed(_feed(CHAINLINK_ETH, CHAINLINK_USD, makeAddr("agg"), 8));
+        _addFeed(_feed(CHAINLINK_ETH, CHAINLINK_USD, makeAddr("agg")));
         vm.prank(stranger);
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, stranger));
         reg.removeConversionFeeds(one(CHAINLINK_ETH), one(CHAINLINK_USD));
@@ -212,7 +198,7 @@ contract ConversionFeedTest is Test {
     ///      Silently removing the prefix would be the worst outcome — a partly-applied governance action
     ///      that reports success.
     function test_removeConversionFeeds_lengthMismatch_reverts() public {
-        _addFeed(_feed(CHAINLINK_ETH, CHAINLINK_USD, makeAddr("agg"), 8));
+        _addFeed(_feed(CHAINLINK_ETH, CHAINLINK_USD, makeAddr("agg")));
 
         address[] memory bases = new address[](2);
         bases[0] = CHAINLINK_ETH;
@@ -226,7 +212,7 @@ contract ConversionFeedTest is Test {
     /// @notice A removal batch is all-or-nothing: one missing key reverts the whole call and the feed
     ///         that WOULD have been removed is still there.
     function test_removeConversionFeeds_batchIsAtomic() public {
-        _addFeed(_feed(CHAINLINK_ETH, CHAINLINK_USD, makeAddr("agg"), 8));
+        _addFeed(_feed(CHAINLINK_ETH, CHAINLINK_USD, makeAddr("agg")));
 
         address[] memory bases = new address[](2);
         address[] memory quotes = new address[](2);
@@ -247,9 +233,9 @@ contract ConversionFeedTest is Test {
 
     function test_addConversionFeedsBatch_batch() public {
         IMarketRegistry.ConversionFeed[] memory batch = new IMarketRegistry.ConversionFeed[](3);
-        batch[0] = _feed(CHAINLINK_ETH, CHAINLINK_USD, makeAddr("a0"), 8);
-        batch[1] = _feed(CHAINLINK_USD, CHAINLINK_ETH, makeAddr("a1"), 18);
-        batch[2] = _feed(makeAddr("tokenA"), makeAddr("tokenB"), makeAddr("a2"), 6);
+        batch[0] = _feed(CHAINLINK_ETH, CHAINLINK_USD, makeAddr("a0"));
+        batch[1] = _feed(CHAINLINK_USD, CHAINLINK_ETH, makeAddr("a1"));
+        batch[2] = _feed(makeAddr("tokenA"), makeAddr("tokenB"), makeAddr("a2"));
 
         vm.prank(owner);
         reg.addConversionFeeds(batch);
@@ -266,8 +252,8 @@ contract ConversionFeedTest is Test {
     /// @notice A duplicate natural key inside a seed batch reverts the whole atomic transaction.
     function test_addConversionFeedsBatch_duplicateInBatch_reverts() public {
         IMarketRegistry.ConversionFeed[] memory batch = new IMarketRegistry.ConversionFeed[](2);
-        batch[0] = _feed(CHAINLINK_ETH, CHAINLINK_USD, makeAddr("a0"), 8);
-        batch[1] = _feed(CHAINLINK_ETH, CHAINLINK_USD, makeAddr("a1"), 18); // same key
+        batch[0] = _feed(CHAINLINK_ETH, CHAINLINK_USD, makeAddr("a0"));
+        batch[1] = _feed(CHAINLINK_ETH, CHAINLINK_USD, makeAddr("a1")); // same key
 
         vm.prank(owner);
         vm.expectRevert(IMarketRegistry.EntryAlreadyExists.selector);
@@ -280,7 +266,7 @@ contract ConversionFeedTest is Test {
 
     function test_addConversionFeedsBatch_nonOwner_reverts() public {
         IMarketRegistry.ConversionFeed[] memory batch = new IMarketRegistry.ConversionFeed[](1);
-        batch[0] = _feed(CHAINLINK_ETH, CHAINLINK_USD, makeAddr("a0"), 8);
+        batch[0] = _feed(CHAINLINK_ETH, CHAINLINK_USD, makeAddr("a0"));
         vm.prank(stranger);
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, stranger));
         reg.addConversionFeeds(batch);
