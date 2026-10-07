@@ -13,9 +13,9 @@ import {Initializable} from "@openzeppelin/contracts/proxy/utils/Initializable.s
 /// @title CorkMarketCreator
 /// @notice Direct, permissionless market creation: the same pool a `CorkLimitOrderAdapter` fill
 ///         derives and creates just in time, creatable AHEAD of the fill by anyone willing to pay
-///         for it. A smart contract account that cannot sign an ERC-2612 permit creates the pool
-///         here first, approves the resulting cST to the limit order protocol, and then fills with
-///         no permit at all.
+///         for it. A smart contract account can sign the share-token permit (ERC-1271), or skip it:
+///         create the pool here first, approve the resulting cST to the limit order protocol, and
+///         then fill with no permit at all.
 ///
 ///         THIS IS THE SINGLE CREATION PATH. `CorkLimitOrderAdapter` calls {createNewPool} with the
 ///         market instruction an order carries and takes the pool id and the share addresses back.

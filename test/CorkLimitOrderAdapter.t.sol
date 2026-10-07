@@ -23,11 +23,13 @@ import {
     MockJITController,
     MockJITPoolManager,
     MockLimitOrderProtocol,
+    MockPermitERC20,
     MockRateOracle,
     OrderBuilder,
     PermissiveRecipe
 } from "./mocks/JITMocks.sol";
 import {MockWrapperFactory} from "./mocks/MockWrapperFactory.sol";
+import {ERC1271WalletMock} from "@phoenix-test/forge/mocks/ERC1271WalletMock.sol";
 import {one} from "./helpers/ArrayHelpers.sol";
 
 /// @dev The JIT suite runs the REAL `MarketRegistry` (assets, approved recipe, `deploy`), the REAL
@@ -284,9 +286,8 @@ contract CorkLimitOrderAdapterTest is Test {
         });
     }
 
-    /// @dev An empty permit array: no permits carried. The mock cST is a plain MockERC20 with
-    ///      no `permit`, so the mock suite always drives the no-permit path; the permit-specific
-    ///      test below carries one on purpose.
+    /// @dev An empty permit array: no permits carried. Most tests fund the LOP's pull some other
+    ///      way; the carried-permit tests below carry permits on purpose.
     function _noPermits() internal pure returns (CorkLimitOrderAdapter.PermitParams[] memory p) {}
 
     function _extraData() internal view returns (bytes memory) {
@@ -1218,39 +1219,164 @@ contract CorkLimitOrderAdapterTest is Test {
 
     // -- Carried permits (PermitParams) -----------------------------------------------------------
 
-    /// @dev A carried permit that fails to execute must revert the whole fill: the allowance
-    ///      the order depends on could not be granted, so there is nothing for the LOP's pull
-    ///      to find. The mock cST has no `permit` function at all, standing in for any failed
-    ///      permit execution; the missing selector reverts with empty data.
-    function test_carriedPermitFailure_revertsTheFill() public {
-        CorkLimitOrderAdapter.PermitParams[] memory permits = new CorkLimitOrderAdapter.PermitParams[](1);
-        permits[0].token = address(poolManager.cst());
-        permits[0].value = 1e18;
-        permits[0].deadline = block.timestamp + 1 days;
+    /// @dev Sign the cST `bytes` permit `owner -> LOP` with `pk`, at the owner's current nonce.
+    ///      Returns the 65-byte `r ++ s ++ v` form a normal wallet produces.
+    function _signCstPermit(uint256 pk, address permitOwner, uint256 value, uint256 deadline)
+        internal
+        view
+        returns (bytes memory)
+    {
+        MockPermitERC20 cst = poolManager.cst();
+        bytes32 structHash = keccak256(
+            abi.encode(cst.PERMIT_TYPEHASH(), permitOwner, address(lop), value, cst.nonces(permitOwner), deadline)
+        );
+        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", cst.DOMAIN_SEPARATOR(), structHash));
+        (uint8 v, bytes32 r, bytes32 sig) = vm.sign(pk, digest);
+        return abi.encodePacked(r, sig, v);
+    }
 
+    /// @dev One carried cST permit.
+    function _cstPermit(uint256 value, uint256 deadline, bytes memory signature)
+        internal
+        view
+        returns (CorkLimitOrderAdapter.PermitParams[] memory permits)
+    {
+        permits = new CorkLimitOrderAdapter.PermitParams[](1);
+        permits[0] = CorkLimitOrderAdapter.PermitParams({
+            token: address(poolManager.cst()), value: value, deadline: deadline, signature: signature
+        });
+    }
+
+    /// @dev Give `maker` the collateral and the adapter allowance a maker-side JIT mint needs.
+    function _fundMaker(address maker) internal {
+        collateral.mint(maker, 50_000e6);
+        collateral.setAllowance(maker, address(hook), type(uint256).max);
+    }
+
+    /// @dev A normal wallet maker signs the 65-byte permit. The adapter executes it and the LOP
+    ///      finds its allowance in place.
+    function test_carriedPermit_eoaSignature_grantsTheAllowance() public {
+        (address maker, uint256 pk) = makeAddrAndKey("eoaMaker");
+        _fundMaker(maker);
+        uint256 deadline = block.timestamp + 1 days;
+        bytes memory extraData =
+            abi.encode(_params(), _cstPermit(1e18, deadline, _signCstPermit(pk, maker, 1e18, deadline)));
+
+        lop.callPreInteraction(
+            hook, OrderBuilder.build(maker, address(poolManager.cst()), PREMIUM_TOKEN, 1e18, 0), 1e18, 0, extraData
+        );
+
+        assertEq(poolManager.cst().nonces(maker), 1, "the permit was executed");
+        assertEq(poolManager.cst().allowance(maker, address(lop)), 1e18, "the LOP holds the signed allowance");
+        _assertNoCustody();
+    }
+
+    /// @dev A contract wallet maker (a Safe, say) cannot sign a `v, r, s` permit. Through the
+    ///      `bytes` permit the token asks the wallet itself, so the permit works for it too.
+    function test_carriedPermit_contractWalletMaker_grantsTheAllowance() public {
+        (address signer, uint256 pk) = makeAddrAndKey("walletSigner");
+        address wallet = address(new ERC1271WalletMock(signer));
+        _fundMaker(wallet);
+        uint256 deadline = block.timestamp + 1 days;
+        bytes memory extraData =
+            abi.encode(_params(), _cstPermit(1e18, deadline, _signCstPermit(pk, wallet, 1e18, deadline)));
+
+        lop.callPreInteraction(
+            hook, OrderBuilder.build(wallet, address(poolManager.cst()), PREMIUM_TOKEN, 1e18, 0), 1e18, 0, extraData
+        );
+
+        assertEq(poolManager.cst().nonces(wallet), 1, "the permit was executed");
+        assertEq(poolManager.cst().allowance(wallet, address(lop)), 1e18, "the LOP holds the signed allowance");
+        _assertNoCustody();
+    }
+
+    /// @dev Same for a contract wallet on the taker side: the taker mints its delivery and its
+    ///      carried permit grants the LOP the pull.
+    function test_carriedPermit_contractWalletTaker_grantsTheAllowance() public {
+        (address signer, uint256 pk) = makeAddrAndKey("walletSigner");
+        address wallet = address(new ERC1271WalletMock(signer));
+        _fundMaker(wallet);
+        uint256 deadline = block.timestamp + 1 days;
+        bytes memory extraData =
+            abi.encode(_params(), _cstPermit(1e18, deadline, _signCstPermit(pk, wallet, 1e18, deadline)));
+
+        lop.callTakerInteraction(hook, _bidOrder(1e18), wallet, 0, 1e18, extraData);
+
+        assertEq(poolManager.cst().balanceOf(wallet), 1e18, "the taker minted its delivery");
+        assertEq(poolManager.cst().nonces(wallet), 1, "the permit was executed");
+        assertEq(poolManager.cst().allowance(wallet, address(lop)), 1e18, "the LOP holds the signed allowance");
+        _assertNoCustody();
+    }
+
+    /// @dev A carried permit that fails to execute must revert the whole fill: the allowance the
+    ///      order depends on could not be granted, so there is nothing for the LOP's pull to find.
+    ///      Here the wrong key signs, and the token's own error reaches the fill unchanged.
+    function test_carriedPermit_badSignature_revertsTheFill() public {
+        (, uint256 wrongPk) = makeAddrAndKey("notBond");
+        uint256 deadline = block.timestamp + 1 days;
+        bytes memory extraData =
+            abi.encode(_params(), _cstPermit(1e18, deadline, _signCstPermit(wrongPk, BOND, 1e18, deadline)));
         IOrderMixin.Order memory order = _askOrder(1e18);
-        bytes memory extraData = abi.encode(_params(), permits);
 
-        vm.expectRevert(bytes(""));
+        vm.expectRevert(abi.encodeWithSelector(IErrors.InvalidPermitSignature.selector, BOND));
         lop.callPreInteraction(hook, order, 1e18, 0, extraData);
     }
 
-    /// @dev A permit whose allowance is ALREADY in place is skipped, so a front-runner who
-    ///      consumed the public signature (granting exactly what the maker intended) cannot
-    ///      brick the order. The mock cST still has no `permit` function — the fill completing
-    ///      proves the adapter never called it.
-    function test_carriedPermit_skippedWhenAllowanceAlreadyInPlace() public {
-        CorkLimitOrderAdapter.PermitParams[] memory permits = new CorkLimitOrderAdapter.PermitParams[](1);
-        permits[0].token = address(poolManager.cst());
-        permits[0].value = 1e18;
-        permits[0].deadline = block.timestamp + 1 days;
+    /// @dev A contract wallet that does not approve the signature makes the fill revert with the
+    ///      same error, naming the wallet.
+    function test_carriedPermit_contractWalletRejects_revertsTheFill() public {
+        (address signer,) = makeAddrAndKey("walletSigner");
+        (, uint256 wrongPk) = makeAddrAndKey("notTheSigner");
+        address wallet = address(new ERC1271WalletMock(signer));
+        _fundMaker(wallet);
+        uint256 deadline = block.timestamp + 1 days;
+        bytes memory extraData =
+            abi.encode(_params(), _cstPermit(1e18, deadline, _signCstPermit(wrongPk, wallet, 1e18, deadline)));
+        IOrderMixin.Order memory order = OrderBuilder.build(wallet, address(poolManager.cst()), PREMIUM_TOKEN, 1e18, 0);
 
+        vm.expectRevert(abi.encodeWithSelector(IErrors.InvalidPermitSignature.selector, wallet));
+        lop.callPreInteraction(hook, order, 1e18, 0, extraData);
+    }
+
+    /// @dev A permit whose allowance is ALREADY in place is skipped. The carried signature here is
+    ///      empty, so the token would revert if the adapter called it: the fill completing proves
+    ///      the adapter never did.
+    function test_carriedPermit_skippedWhenAllowanceAlreadyInPlace() public {
         poolManager.cst().setAllowance(BOND, address(lop), 1e18);
 
-        lop.callPreInteraction(hook, _askOrder(1e18), 1e18, 0, abi.encode(_params(), permits));
+        lop.callPreInteraction(
+            hook, _askOrder(1e18), 1e18, 0, abi.encode(_params(), _cstPermit(1e18, block.timestamp + 1 days, ""))
+        );
 
         assertEq(controller.createCalls(), 1, "the fill went through without executing the permit");
         assertEq(poolManager.cst().balanceOf(BOND), 1e18, "and the mint went through");
+        assertEq(poolManager.cst().nonces(BOND), 0, "no permit was executed");
+        _assertNoCustody();
+    }
+
+    /// @dev THE FRONT-RUN. The carried signature is public, so anyone can submit it to the token
+    ///      first and use up the nonce. That grants the LOP exactly what the maker signed, so the
+    ///      adapter skips the permit and the fill still completes.
+    function test_carriedPermit_frontRun_fillStillCompletes() public {
+        (address maker, uint256 pk) = makeAddrAndKey("eoaMaker");
+        _fundMaker(maker);
+        uint256 deadline = block.timestamp + 1 days;
+        bytes memory signature = _signCstPermit(pk, maker, 1e18, deadline);
+
+        vm.prank(makeAddr("attacker"));
+        poolManager.cst().permit(maker, address(lop), 1e18, deadline, signature);
+        assertEq(poolManager.cst().nonces(maker), 1, "the attacker used up the nonce");
+
+        lop.callPreInteraction(
+            hook,
+            OrderBuilder.build(maker, address(poolManager.cst()), PREMIUM_TOKEN, 1e18, 0),
+            1e18,
+            0,
+            abi.encode(_params(), _cstPermit(1e18, deadline, signature))
+        );
+
+        assertEq(poolManager.cst().nonces(maker), 1, "the adapter skipped the used permit");
+        assertEq(poolManager.cst().balanceOf(maker), 1e18, "and the mint went through");
         _assertNoCustody();
     }
 
@@ -1278,17 +1404,14 @@ contract CorkLimitOrderAdapterTest is Test {
             token: address(poolManager.cst()),
             value: 1e18,
             deadline: block.timestamp + 1 days,
-            v: 27,
-            r: keccak256("r0"),
-            s: keccak256("s0")
+            signature: abi.encodePacked(keccak256("r0"), keccak256("s0"), uint8(27))
         });
+        // A contract wallet signature need not be 65 bytes, so the second one is not.
         permits[1] = CorkLimitOrderAdapter.PermitParams({
-            token: address(collateral),
+            token: address(poolManager.cpt()),
             value: type(uint256).max,
             deadline: block.timestamp + 2 days,
-            v: 28,
-            r: keccak256("r1"),
-            s: keccak256("s1")
+            signature: abi.encodePacked(keccak256("safe"), keccak256("owners"), keccak256("sigs"), uint8(1))
         });
     }
 
@@ -1319,9 +1442,7 @@ contract CorkLimitOrderAdapterTest is Test {
             assertEq(p[i].token, permits[i].token, "permit token");
             assertEq(p[i].value, permits[i].value, "permit value");
             assertEq(p[i].deadline, permits[i].deadline, "permit deadline");
-            assertEq(p[i].v, permits[i].v, "permit v");
-            assertEq(p[i].r, permits[i].r, "permit r");
-            assertEq(p[i].s, permits[i].s, "permit s");
+            assertEq(p[i].signature, permits[i].signature, "permit signature");
         }
     }
 
@@ -1343,7 +1464,7 @@ contract CorkLimitOrderAdapterTest is Test {
     }
 
     function test_version() public view {
-        assertEq(hook.version(), "0.4.0");
+        assertEq(hook.version(), "0.5.0");
     }
 
     // -- Non-standard ERC20 collateral -----------------------------------------------------------

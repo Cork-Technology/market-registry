@@ -7,9 +7,9 @@ import {IMarketRegistry} from "./IMarketRegistry.sol";
 /// @title ICorkMarketCreator
 /// @notice Direct, permissionless market creation: the same pool a `CorkLimitOrderAdapter` fill
 ///         derives and creates just in time, creatable AHEAD of the fill by anyone willing to pay
-///         for it. Integrators build against this interface — a smart contract account batches
-///         `createNewPool` → `cst.approve(limitOrderProtocol)` → the fill with an empty permit
-///         array, and never needs the ERC-2612 permit it cannot sign.
+///         for it. Integrators build against this interface — a smart contract account that would
+///         rather not sign the share-token permit batches `createNewPool` →
+///         `cst.approve(limitOrderProtocol)` → the fill with an empty permit array.
 ///
 ///         This is the single creation path. The adapter hands its market instruction to
 ///         {createNewPool} and gets the pool id and the share addresses back, so the creation logic

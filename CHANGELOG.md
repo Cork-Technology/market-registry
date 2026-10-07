@@ -7,6 +7,24 @@ and removals. Deployed addresses live in the GitHub Release for each version, no
 Versions follow semantic versioning below `1.0.0`: a breaking change on a covered surface
 bumps the middle number, everything else bumps the last number.
 
+## 0.6.0
+
+Breaking. The limit-order adapter carries share-token permits as a single signature, so contract wallets can sign them.
+
+### Changed
+
+- `CorkLimitOrderAdapter.PermitParams` replaces the `v`, `r` and `s` fields with one `bytes signature` field. `encodeExtraData` has a new selector, `decodeExtraData` returns the new shape, and `extraData` built in the 0.5.0 format no longer decodes. Rebuild any signed order that carries a permit.
+- Builds no longer embed the compiler metadata hash, so the same source gives the same bytecode on every chain.
+
+### Behaviour
+
+- A Safe or other ERC-1271 contract wallet can now sign the share-token permit. Creating first, approving, then filling still works. This reverses the 0.5.0 notes that a smart-contract account cannot sign a permit and that the adapter uses only the ERC-2612 form.
+- The adapter is redeployed; its `version()` reads `0.5.0`. The 0.4.0 adapter keeps running at its old address.
+
+### Deprecated
+
+- Nothing.
+
 ## 0.5.0
 
 Breaking. A registry keyed by unit address, a single market-creation path shared by direct

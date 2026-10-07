@@ -21,10 +21,11 @@ pragma solidity ^0.8.30;
 //
 // 2. THE LOP NEEDS A cST ALLOWANCE THAT CANNOT PRE-EXIST. Allowances live in the token's
 //    own storage; a not-yet-deployed token cannot have been approved. The party delivering
-//    cST therefore signs an ERC-2612 permit against the PREDICTED address (nonce 0, the
+//    cST therefore signs a share-token permit against the PREDICTED address (nonce 0, the
 //    domain separator recorded during the simulation), carried in the hook's `extraData`
 //    (PermitParams[]) and executed by the adapter right after the JIT mint — one call before
-//    the LOP's transferFrom needs it.
+//    the LOP's transferFrom needs it. The permit takes a `bytes` signature, so a contract
+//    wallet (a Safe) can sign it too; see the ERC-1271 tests below.
 //
 // 3. THE MARKET'S RATE CONSTRAINT IS SIGNED, NOT DERIVED, AND THAT IS THE CHANGE THIS FILE
 //    ABSORBED. The payload used to carry a mode STRING, and the adapter derived the four rate
@@ -50,9 +51,9 @@ import {IDefaultCorkController} from "contracts/interfaces/IDefaultCorkControlle
 import {IErrors} from "contracts/interfaces/IErrors.sol";
 import {IPoolManager, Market, MarketId} from "contracts/interfaces/IPoolManager.sol";
 import {PoolShare} from "contracts/core/assets/PoolShare.sol";
-import {ERC20Permit} from "@openzeppelin/contracts/token/ERC20/extensions/ERC20Permit.sol";
 import {BaseTest} from "@phoenix-test/forge/BaseTest.sol";
 import {DummyWETH} from "@phoenix-test/forge/mocks/DummyWETH.sol";
+import {ERC1271WalletMock} from "@phoenix-test/forge/mocks/ERC1271WalletMock.sol";
 import {CorkLimitOrderAdapter} from "../src/CorkLimitOrderAdapter.sol";
 import {CorkMarketCreator} from "../src/CorkMarketCreator.sol";
 import {FixedRateOracleFactory} from "../src/FixedRateOracleFactory.sol";
@@ -279,9 +280,10 @@ contract CorkLopE2ETest is BaseTest {
 
     // ── Hook payload helpers ────────────────────────────────────────────────
 
-    /// @dev A single carried permit: ERC-2612 permit over the PREDICTED cST, owner -> LOP for
-    ///      `value`, signed with the domain separator recorded during the simulation and
-    ///      nonce 0 (the token will be freshly deployed when the adapter executes it).
+    /// @dev A single carried permit: the cST `bytes` permit over the PREDICTED cST, owner -> LOP
+    ///      for `value`, signed with the domain separator recorded during the simulation and
+    ///      nonce 0 (the token will be freshly deployed when the adapter executes it). `pk` signs
+    ///      for `owner` directly, or for the contract wallet `owner` whose signer it is.
     function _cstPermit(uint256 pk, address owner, uint256 value)
         internal
         view
@@ -295,7 +297,8 @@ contract CorkLopE2ETest is BaseTest {
             Permit({owner: owner, spender: address(lop), value: value, nonce: 0, deadline: permits[0].deadline}),
             cstDomainSeparator
         );
-        (permits[0].v, permits[0].r, permits[0].s) = vm.sign(pk, digest);
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(pk, digest);
+        permits[0].signature = abi.encodePacked(r, s, v);
     }
 
     /// @dev The market every order in this suite carries, as the creator's own params: what the
@@ -561,7 +564,7 @@ contract CorkLopE2ETest is BaseTest {
         // The attacker executes the maker's own permit signature, consuming nonce 0.
         PoolShare cst = PoolShare(predictedCst);
         vm.prank(makeAddr("attacker"));
-        cst.permit(bond, address(lop), cstShares, permits[0].deadline, permits[0].v, permits[0].r, permits[0].s);
+        cst.permit(bond, address(lop), cstShares, permits[0].deadline, permits[0].signature);
         assertEq(cst.nonces(bond), 1, "the attacker consumed the permit nonce");
         assertEq(cst.allowance(bond, address(lop)), cstShares, "and granted the intended allowance");
 
@@ -580,8 +583,8 @@ contract CorkLopE2ETest is BaseTest {
 
     /// @dev THE OTHER HALF of the defensive execution: a wrongly-signed carried permit aborts
     ///      the fill in `preInteraction`. The adapter no longer swallows permit failures — the
-    ///      permit here is signed by the WRONG key, so `permit` recovers a different owner and
-    ///      its revert bubbles up through the adapter, reverting the whole fill.
+    ///      permit here is signed by the WRONG key, so the token rejects it with
+    ///      `InvalidPermitSignature(bond)` and that revert reverts the whole fill.
     function test_e2e_uselessPermit_revertsTheFill() public {
         uint256 cstShares = 20_000e18;
         uint256 premiumAmount = 1_000e18;
@@ -603,7 +606,7 @@ contract CorkLopE2ETest is BaseTest {
 
         TakerTraits takerTraits =
             TakerTraits.wrap(_MAKER_AMOUNT_FLAG | (extension.length << _ARGS_EXTENSION_LENGTH_OFFSET));
-        vm.expectPartialRevert(ERC20Permit.ERC2612InvalidSigner.selector);
+        vm.expectRevert(abi.encodeWithSelector(IErrors.InvalidPermitSignature.selector, bond));
         vm.prank(lifter);
         lop.fillOrderArgs(order, r, vs, cstShares, takerTraits, extension);
     }
@@ -615,7 +618,7 @@ contract CorkLopE2ETest is BaseTest {
     ///      pull drops the allowance to half. The second fill must NOT replay the consumed signature:
     ///      the allowance left over covers what this fill pulls, so the adapter skips the permit and the
     ///      remaining liquidity fills without a fresh maker transaction. Before the skip was keyed to
-    ///      the pull, the second fill replayed the dead permit and died with `ERC2612InvalidSigner`.
+    ///      the pull, the second fill replayed the dead permit and died on the used signature.
     function test_e2e_partialFills_oneFinitePermitCarriesBothFills() public {
         uint256 cstShares = 20_000e18;
         uint256 premiumAmount = 1_000e18;
@@ -662,7 +665,7 @@ contract CorkLopE2ETest is BaseTest {
 
     /// @dev THE GUARD on the skip. Keying it to the pull must not loosen it: an allowance that covers a
     ///      quarter does not cover a half-fill, so the carried permit is still executed — and this one
-    ///      is signed by the wrong key, so the fill still reverts `ERC2612InvalidSigner`. A skip that
+    ///      is signed by the wrong key, so the fill still reverts `InvalidPermitSignature`. A skip that
     ///      fired on any non-zero allowance would let this fill reach the LOP's pull and fail there
     ///      with a less useful error, or worse.
     function test_e2e_partialAllowanceWithWrongSignerPermit_stillReverts() public {
@@ -690,9 +693,170 @@ contract CorkLopE2ETest is BaseTest {
         TakerTraits takerTraits =
             TakerTraits.wrap(_MAKER_AMOUNT_FLAG | (extension.length << _ARGS_EXTENSION_LENGTH_OFFSET));
 
-        vm.expectPartialRevert(ERC20Permit.ERC2612InvalidSigner.selector);
+        vm.expectRevert(abi.encodeWithSelector(IErrors.InvalidPermitSignature.selector, bond));
         vm.prank(lifter);
         lop.fillOrderArgs(order, r, vs, cstShares / 2, takerTraits, extension);
+    }
+
+    // ── Contract wallets: ERC-1271 makers and takers ────────────────────────
+
+    /// @dev A contract wallet (a Safe, say) whose single signer is `signerPk`, funded and approved
+    ///      like `bond`. It cannot sign a `v, r, s` permit; the `bytes` permit asks the wallet.
+    function _fundedWallet(uint256 signerPk) internal returns (address wallet) {
+        wallet = address(new ERC1271WalletMock(vm.addr(signerPk)));
+        usdc.mint(wallet, BOND_FUNDING);
+        vm.prank(wallet);
+        usdc.approve(address(hook), type(uint256).max);
+    }
+
+    /// @dev The ask of {test_e2e_preInteraction_realPhoenix}, made by a CONTRACT WALLET. The LOP
+    ///      checks the order through ERC-1271 (`fillContractOrderArgs`), and the cST token checks
+    ///      the carried permit the same way. Neither the pool nor the cST exists at fill time.
+    function test_e2e_contractWalletMaker_bytesPermit() public {
+        (, uint256 signerPk) = makeAddrAndKey("safeSigner");
+        address wallet = _fundedWallet(signerPk);
+        uint256 cstShares = 20_000e18;
+        uint256 premiumAmount = 1_000e18;
+
+        bytes memory extension =
+            _buildExtensionWithPreInteraction(address(hook), _extraData(_cstPermit(signerPk, wallet, cstShares)));
+        ILopOrderMixin.Order memory order = ILopOrderMixin.Order({
+            salt: _saltFor(extension),
+            maker: _addr(wallet),
+            receiver: _addr(address(0)),
+            makerAsset: _addr(predictedCst),
+            takerAsset: _addr(address(premium)),
+            makingAmount: cstShares,
+            takingAmount: premiumAmount,
+            makerTraits: MakerTraits.wrap(_PRE_INTERACTION_CALL_FLAG | _HAS_EXTENSION_FLAG)
+        });
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(signerPk, lop.hashOrder(order));
+        TakerTraits takerTraits =
+            TakerTraits.wrap(_MAKER_AMOUNT_FLAG | (extension.length << _ARGS_EXTENSION_LENGTH_OFFSET));
+
+        assertEq(predictedCst.code.length, 0, "cST does not exist at fill time");
+
+        vm.prank(lifter);
+        (uint256 made, uint256 took,) =
+            lop.fillContractOrderArgs(order, abi.encodePacked(r, s, v), cstShares, takerTraits, extension);
+
+        assertEq(made, cstShares, "full making amount filled");
+        assertEq(took, premiumAmount, "full taking amount paid");
+        PoolShare cst = PoolShare(predictedCst);
+        assertEq(cst.balanceOf(lifter), cstShares, "taker received the JIT-minted cST");
+        assertEq(PoolShare(predictedCpt).balanceOf(wallet), cstShares, "wallet keeps the cPT leg");
+        assertEq(premium.balanceOf(wallet), premiumAmount, "wallet received the premium");
+        assertEq(cst.allowance(wallet, address(lop)), 0, "permit allowance exactly consumed");
+        assertEq(cst.nonces(wallet), 1, "the carried permit was executed");
+        _assertNoCustody();
+    }
+
+    /// @dev A contract wallet on the TAKER side: it lifts the bid of
+    ///      {test_e2e_takerInteraction_realPhoenix}, and its carried permit is checked through
+    ///      ERC-1271 between the two transfers.
+    function test_e2e_contractWalletTaker_bytesPermit() public {
+        (, uint256 signerPk) = makeAddrAndKey("safeSigner");
+        address wallet = _fundedWallet(signerPk);
+        uint256 cstShares = 7_500e18;
+        uint256 premiumAmount = 400e18;
+
+        ILopOrderMixin.Order memory order = ILopOrderMixin.Order({
+            salt: 1,
+            maker: _addr(bidder),
+            receiver: _addr(address(0)),
+            makerAsset: _addr(address(premium)),
+            takerAsset: _addr(predictedCst),
+            makingAmount: premiumAmount,
+            takingAmount: cstShares,
+            makerTraits: MakerTraits.wrap(0)
+        });
+        (bytes32 r, bytes32 vs) = _signOrder(bidderPk, order);
+        bytes memory interaction =
+            abi.encodePacked(address(hook), _extraData(_cstPermit(signerPk, wallet, cstShares), false));
+        TakerTraits takerTraits =
+            TakerTraits.wrap(_MAKER_AMOUNT_FLAG | (interaction.length << _ARGS_INTERACTION_LENGTH_OFFSET));
+
+        vm.prank(wallet);
+        (uint256 made, uint256 took,) = lop.fillOrderArgs(order, r, vs, premiumAmount, takerTraits, interaction);
+
+        assertEq(made, premiumAmount, "full premium side filled");
+        assertEq(took, cstShares, "full cST side delivered");
+        PoolShare cst = PoolShare(predictedCst);
+        assertEq(cst.balanceOf(bidder), cstShares, "bid maker received the JIT-minted cST");
+        assertEq(premium.balanceOf(wallet), premiumAmount, "wallet received the premium");
+        assertEq(cst.allowance(wallet, address(lop)), 0, "permit allowance exactly consumed");
+        assertEq(cst.nonces(wallet), 1, "the carried permit was executed");
+        _assertNoCustody();
+    }
+
+    /// @dev THE FRONT-RUN, for a contract wallet maker. A third party submits the wallet's public
+    ///      `bytes` permit first. The LOP already holds the signed allowance, so the adapter skips
+    ///      the permit and the fill still completes.
+    function test_e2e_contractWalletMaker_frontRunPermit_fillStillCompletes() public {
+        (, uint256 signerPk) = makeAddrAndKey("safeSigner");
+        address wallet = _fundedWallet(signerPk);
+        uint256 cstShares = 20_000e18;
+        uint256 premiumAmount = 1_000e18;
+
+        creator.createNewPool(_marketParams());
+        CorkLimitOrderAdapter.PermitParams[] memory permits = _cstPermit(signerPk, wallet, cstShares);
+        bytes memory extension = _buildExtensionWithPreInteraction(address(hook), _extraData(permits));
+        ILopOrderMixin.Order memory order = ILopOrderMixin.Order({
+            salt: _saltFor(extension),
+            maker: _addr(wallet),
+            receiver: _addr(address(0)),
+            makerAsset: _addr(predictedCst),
+            takerAsset: _addr(address(premium)),
+            makingAmount: cstShares,
+            takingAmount: premiumAmount,
+            makerTraits: MakerTraits.wrap(_PRE_INTERACTION_CALL_FLAG | _HAS_EXTENSION_FLAG)
+        });
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(signerPk, lop.hashOrder(order));
+
+        PoolShare cst = PoolShare(predictedCst);
+        vm.prank(makeAddr("attacker"));
+        cst.permit(wallet, address(lop), cstShares, permits[0].deadline, permits[0].signature);
+        assertEq(cst.nonces(wallet), 1, "the attacker used up the permit nonce");
+
+        TakerTraits takerTraits =
+            TakerTraits.wrap(_MAKER_AMOUNT_FLAG | (extension.length << _ARGS_EXTENSION_LENGTH_OFFSET));
+        vm.prank(lifter);
+        (uint256 made,,) =
+            lop.fillContractOrderArgs(order, abi.encodePacked(r, s, v), cstShares, takerTraits, extension);
+
+        assertEq(made, cstShares, "the front-run order still fills in full");
+        assertEq(cst.balanceOf(lifter), cstShares, "taker received the cST");
+        assertEq(cst.allowance(wallet, address(lop)), 0, "the front-run allowance was exactly consumed");
+        assertEq(cst.nonces(wallet), 1, "the adapter skipped the used permit");
+        _assertNoCustody();
+    }
+
+    /// @dev A contract wallet that does not approve the permit signature reverts the fill with
+    ///      the token's `InvalidPermitSignature`, naming the wallet.
+    function test_e2e_contractWalletMaker_wrongSigner_revertsTheFill() public {
+        (, uint256 signerPk) = makeAddrAndKey("safeSigner");
+        address wallet = _fundedWallet(signerPk);
+        uint256 cstShares = 20_000e18;
+
+        bytes memory extension =
+            _buildExtensionWithPreInteraction(address(hook), _extraData(_cstPermit(bidderPk, wallet, cstShares)));
+        ILopOrderMixin.Order memory order = ILopOrderMixin.Order({
+            salt: _saltFor(extension),
+            maker: _addr(wallet),
+            receiver: _addr(address(0)),
+            makerAsset: _addr(predictedCst),
+            takerAsset: _addr(address(premium)),
+            makingAmount: cstShares,
+            takingAmount: 1_000e18,
+            makerTraits: MakerTraits.wrap(_PRE_INTERACTION_CALL_FLAG | _HAS_EXTENSION_FLAG)
+        });
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(signerPk, lop.hashOrder(order));
+        TakerTraits takerTraits =
+            TakerTraits.wrap(_MAKER_AMOUNT_FLAG | (extension.length << _ARGS_EXTENSION_LENGTH_OFFSET));
+
+        vm.expectRevert(abi.encodeWithSelector(IErrors.InvalidPermitSignature.selector, wallet));
+        vm.prank(lifter);
+        lop.fillContractOrderArgs(order, abi.encodePacked(r, s, v), cstShares, takerTraits, extension);
     }
 
     // ── Negative control: wrong caller cannot trigger the hook ─────────────

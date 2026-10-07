@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.30;
 import {IPoolManager, MarketId} from "contracts/interfaces/IPoolManager.sol";
+import {IPoolShare} from "contracts/interfaces/IPoolShare.sol";
 import {
     Address,
     AddressLib,
@@ -11,7 +12,6 @@ import {
 import {ICorkMarketCreator} from "./interfaces/ICorkMarketCreator.sol";
 import {IVersion} from "./interfaces/IVersion.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import {IERC20Permit} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Permit.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {ReentrancyGuardTransient} from "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
 import {Initializable} from "@openzeppelin/contracts/proxy/utils/Initializable.sol";
@@ -41,9 +41,10 @@ import {Initializable} from "@openzeppelin/contracts/proxy/utils/Initializable.s
 ///           not hold yet gets it minted just in time. With the flag clear, the hook only
 ///           ensures the market exists and the maker is expected to already hold the cST the
 ///           LOP is about to pull. Either way the LOP needs a cST allowance from the maker for
-///           that pull — granted either by a prior approval (existing pool) or by an ERC-2612
+///           that pull — granted either by a prior approval (existing pool) or by a share-token
 ///           permit carried in `extraData` (see {PermitParams}: a just-created cST cannot have
-///           a prior approval, the token did not exist to be approved).
+///           a prior approval, the token did not exist to be approved). The permit takes a
+///           `bytes` signature, so a Safe or other ERC-1271 contract wallet can use it too.
 ///         - `takerInteraction` (taker-side, chosen freely per fill, no maker cooperation):
 ///           fires AFTER the maker asset arrived and BEFORE the LOP pulls the taker asset from
 ///           `msg.sender`, so a taker lifting a buy-cST bid mints its delivery just in time.
@@ -101,13 +102,13 @@ contract CorkLimitOrderAdapter is
         bool enableJitMint; // gate the maker-side mint in `preInteraction`; IGNORED by `takerInteraction`
     }
 
-    /// @notice ERC-2612 permit carried in `extraData` next to the market instruction and executed
+    /// @notice Share-token permit carried in `extraData` next to the market instruction and executed
     ///         by this adapter right after the JIT mint. `extraData` carries an ARRAY of these
-    ///         — any number of permits over any tokens. A carried permit is executed unless the
-    ///         allowance it would grant is already in place (see {_applyPermits}: for the token
-    ///         the LOP pulls, "in place" means enough for THIS fill, so one finite permit carries
-    ///         an order through every partial fill); one that fails to execute reverts the whole
-    ///         fill. An empty array carries none.
+    ///         — any number of permits over any Phoenix share tokens. A carried permit is
+    ///         executed unless the allowance it would grant is already in place (see
+    ///         {_applyPermits}: for the token the LOP pulls, "in place" means enough for THIS
+    ///         fill, so one finite permit carries an order through every partial fill); one that
+    ///         fails to execute reverts the whole fill. An empty array carries none.
     ///
     ///         WHY IT EXISTS: the LOP pulls tokens from the party served with a plain
     ///         `transferFrom` immediately after the interaction returns, which requires an
@@ -120,13 +121,15 @@ contract CorkLimitOrderAdapter is
     ///
     ///         The owner is always the party served (`order.maker` in `preInteraction`, the
     ///         taker in `takerInteraction`), the spender is always the LOP.
+    ///
+    ///         The signature is `bytes` so that every kind of owner can sign: a normal wallet
+    ///         signs 65 bytes (`r ++ s ++ v`), a Safe or other ERC-1271 contract wallet signs in
+    ///         its own format. The token checks it against the owner's type.
     struct PermitParams {
-        address token; // the ERC-2612 token the permit is signed over
+        address token; // the Phoenix share token the permit is signed over
         uint256 value; // allowance granted to the LOP
         uint256 deadline; // permit deadline, unix seconds
-        uint8 v; // signature v
-        bytes32 r; // signature r
-        bytes32 s; // signature s
+        bytes signature; // the owner's signature over the ERC-2612 permit digest
     }
 
     // ─────────────────────────────── Errors ────────────────────────────────
@@ -344,12 +347,12 @@ contract CorkLimitOrderAdapter is
             PermitParams memory p = permits[i];
             uint256 needed = p.token == pulledToken ? pulledAmount : p.value;
             if (IERC20(p.token).allowance(owner, LIMIT_ORDER_PROTOCOL) >= needed) continue;
-            IERC20Permit(p.token).permit(owner, LIMIT_ORDER_PROTOCOL, p.value, p.deadline, p.v, p.r, p.s);
+            IPoolShare(p.token).permit(owner, LIMIT_ORDER_PROTOCOL, p.value, p.deadline, p.signature);
         }
     }
 
     /// @inheritdoc IVersion
     function version() external pure returns (string memory) {
-        return "0.4.0";
+        return "0.5.0";
     }
 }

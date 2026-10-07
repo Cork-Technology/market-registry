@@ -8,6 +8,9 @@ optimizer = true
 optimizer_runs = 200
 build_info = true
 build_info_path = "out/build-info"
+# The same source gives the same bytecode on every chain, so deployments can be verified.
+bytecode_hash = "none"
+cbor_metadata = false
 skip = ["test/CorkLopE2E.t.sol"]
 
 [profile.lop]

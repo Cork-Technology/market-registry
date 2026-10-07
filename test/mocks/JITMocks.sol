@@ -7,6 +7,9 @@ import {CorkLimitOrderAdapter} from "../../src/CorkLimitOrderAdapter.sol";
 import {Address, IOrderMixin, MakerTraits} from "../../src/interfaces/I1inchLimitOrderProtocol.sol";
 import {IMarketRecipe, RecipeSource} from "../../src/interfaces/IMarketRecipe.sol";
 import {IMarketRegistry} from "../../src/interfaces/IMarketRegistry.sol";
+import {EIP712} from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
+import {SignatureChecker} from "@openzeppelin/contracts/utils/cryptography/SignatureChecker.sol";
+import {Nonces} from "@openzeppelin/contracts/utils/Nonces.sol";
 
 /// @dev Minimal ERC-20 for JIT tests. `noReturnData` mimics USDT-style tokens whose
 ///      `transferFrom`/`approve` return nothing, to exercise the hook's safe-ERC20 paths.
@@ -66,6 +69,33 @@ contract MockERC20 {
     }
 }
 
+/// @dev Mock share token with Phoenix `PoolShare`'s `bytes` permit: same typehash, same domain
+///      version, same nonce use, and the same `InvalidPermitSignature(owner)` error. A normal wallet
+///      signs 65 bytes and a contract wallet is asked through ERC-1271, like the real token.
+contract MockPermitERC20 is MockERC20, EIP712, Nonces {
+    error ERC2612ExpiredSignature(uint256 deadline);
+
+    bytes32 public constant PERMIT_TYPEHASH =
+        keccak256("Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)");
+
+    constructor(string memory name_) MockERC20(name_, 18, false) EIP712(name_, "1") {}
+
+    function DOMAIN_SEPARATOR() external view returns (bytes32) {
+        return _domainSeparatorV4();
+    }
+
+    function permit(address owner, address spender, uint256 value, uint256 deadline, bytes calldata signature)
+        external
+    {
+        // forge-lint: disable-next-line(block-timestamp)
+        require(block.timestamp <= deadline, ERC2612ExpiredSignature(deadline));
+        bytes32 digest =
+            _hashTypedDataV4(keccak256(abi.encode(PERMIT_TYPEHASH, owner, spender, value, _useNonce(owner), deadline)));
+        require(SignatureChecker.isValidSignatureNow(owner, digest, signature), IErrors.InvalidPermitSignature(owner));
+        allowance[owner][spender] = value;
+    }
+}
+
 /// @dev Settable rate oracle standing in for a registry-deployed `WrapperRateConsumer`.
 ///      Wired in through `MockWrapperFactory.setFixedWrapper` so `MarketRegistry.deploy`
 ///      returns an address that actually answers `rate()`.
@@ -90,14 +120,15 @@ contract MockRateOracle {
 ///      share legs to `receiver`. Markets are registered by `createMarket` (called by
 ///      `MockJITController`).
 ///      One cPT/cST pair is deployed up front and shared by every market so tests can name the
-///      cST address in orders BEFORE the market exists. `setPaused` makes `previewMint` return
-///      0 (phoenix behavior when paused/expired); `setDriftBps` makes `mint` spend more than
-///      `previewMint` quoted, to exercise the drift guard.
+///      cST address in orders BEFORE the market exists. The cST has the `bytes` permit
+///      ({MockPermitERC20}), so the carried-permit tests run against it. `setPaused` makes
+///      `previewMint` return 0 (phoenix behavior when paused/expired); `setDriftBps` makes `mint`
+///      spend more than `previewMint` quoted, to exercise the drift guard.
 contract MockJITPoolManager {
     error MarketNotInitialized();
 
     MockERC20 public cpt;
-    MockERC20 public cst;
+    MockPermitERC20 public cst;
     mapping(bytes32 => Market) internal _markets;
     uint256 public marketCount;
 
@@ -106,7 +137,7 @@ contract MockJITPoolManager {
 
     constructor() {
         cpt = new MockERC20("cPT", 18, false);
-        cst = new MockERC20("cST", 18, false);
+        cst = new MockPermitERC20("cST");
     }
 
     function setPaused(bool paused_) external {
