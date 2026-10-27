@@ -60,16 +60,20 @@ interface ICorkMarketCreator {
 
     /// @notice Emitted when a call created the pool it derived. Not emitted for a call that
     ///         found the pool already existing.
+    /// @dev The pool id also commits to the four rate-constraint fields (`rateMin`, `rateMax`,
+    ///      `rateChangePerDayMax`, `rateChangeCapacityMax`), which this event does not carry, so
+    ///      the `Market` struct and the id cannot be rebuilt from this event alone; read
+    ///      `IPoolManager.market(poolId)` on the Phoenix pool manager
+    ///      (`CorkMarketCreator.POOL_MANAGER()`) for the full `Market`.
     /// @param poolId The Cork pool id derived and created by this call.
     /// @param rateOracle The registry-deployed oracle the pool adopted.
     /// @param collateralAsset The pool collateral asset.
     /// @param referenceAsset The pool reference asset.
     /// @param expiryTimestamp The pool expiry in unix seconds.
     /// @param recipe The approved `IMarketRecipe` that verified the carried constraint.
-    /// @param swapFeePercentage The pool's swap/exercise fee, 1e18 = 1%. Part of the pool id, so
-    ///        an indexer can rebuild the `Market` struct and the id from this event alone.
-    /// @param unwindSwapFeePercentage The pool's unwindSwap/unwindExercise fee, same scale, same
-    ///        reason.
+    /// @param swapFeePercentage The pool's swap/exercise fee, 1e18 = 1%. Part of the pool id.
+    /// @param unwindSwapFeePercentage The pool's unwindSwap/unwindExercise fee, same scale. Part
+    ///        of the pool id.
     /// @param caller The account that paid for the creation.
     event MarketCreated(
         MarketId indexed poolId,
