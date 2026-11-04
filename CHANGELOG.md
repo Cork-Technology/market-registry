@@ -7,6 +7,14 @@ and removals. Deployed addresses live in the GitHub Release for each version, no
 Versions follow semantic versioning below `1.0.0`: a breaking change on a covered surface
 bumps the middle number, everything else bumps the last number.
 
+## Unreleased
+
+Documentation only. No ABI or bytecode change.
+
+### Changed
+
+- The `ICorkMarketCreator.MarketCreated` NatSpec said an indexer can rebuild the `Market` struct and the pool id from the event alone, and the 0.5.0 entry below said the same of the pool id. This corrects both: the id also commits to `rateMin`, `rateMax`, `rateChangePerDayMax` and `rateChangeCapacityMax`, which the event does not carry. Read `IPoolManager.market(poolId)` on the Phoenix pool manager (`CorkMarketCreator.POOL_MANAGER()`) for the full `Market`. The event does carry the pool id, the rate oracle, both assets in their documented roles, and the recipe that verified the creating call.
+
 ## 0.6.0
 
 Breaking. The limit-order adapter carries share-token permits as a single signature, so contract wallets can sign them.
